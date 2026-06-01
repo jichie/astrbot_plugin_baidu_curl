@@ -43,6 +43,7 @@ def _parse(text: str) -> dict:
 class BaiduCurlPlugin(Star):
     _RE = re.compile(r"https?://pan\.baidu\.com/s/[a-zA-Z0-9_-]+")
 
+
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         cfg = dict(config or {})
@@ -64,10 +65,12 @@ class BaiduCurlPlugin(Star):
         self._client_id: str = ""
         self._client_secret: str = ""
 
+
     async def terminate(self):
         pass
 
     @filter.event_message_type(filter.EventMessageType.ALL)
+
     async def on_message(self, event: AstrMessageEvent):
         text = event.message_str
         # 如果是影视转存命令，跳过（由 media_save 插件处理）
@@ -91,6 +94,7 @@ class BaiduCurlPlugin(Star):
 
         async for msg in self._run(event, surl, pwd):
             yield msg
+
 
     async def _run(self, ev: AstrMessageEvent, surl: str, pwd: str):
         # 1. baidu-autosave 转存
@@ -248,6 +252,7 @@ class BaiduCurlPlugin(Star):
 
     # ---- 从 OpenList 获取凭证并刷新 token ----
 
+
     async def _refresh_access_token(self) -> bool:
         """从 OpenList 加载百度 AccessToken"""
         try:
@@ -269,11 +274,13 @@ class BaiduCurlPlugin(Star):
             logger.error(f"[token] 加载失败: {e}")
         return False
 
+
     
     def _get_dlinks_sync(self, search_dirs: list, file_names: list = None) -> list:
         s = cffi_requests.Session(impersonate="chrome120")
         at = self._access_token
         all_files = []
+
 
         def _list_dir(dir_path):
             """递归列出目录下所有文件"""
@@ -325,6 +332,7 @@ class BaiduCurlPlugin(Star):
                     dlinks.append({"name": f.get("server_filename", nmap.get(f.get("fs_id"), "?")), "dlink": dl})
         return dlinks
 
+
     async def _autosave(self, surl: str, pwd: str) -> dict:
         """调用 baidu-autosave 服务转存文件（使用 curl_cffi，兼容性更好）"""
         if not self.autosave_url:
@@ -338,6 +346,7 @@ class BaiduCurlPlugin(Star):
         except Exception as e:
             logger.error(f"[autosave] 转存失败: {e}")
             return {"success": False, "error": str(e)}
+
 
     def _autosave_sync(self, surl: str, pwd: str) -> dict:
         """同步版本的转存，参考 media_save 插件的实现"""
@@ -497,12 +506,14 @@ class BaiduCurlPlugin(Star):
             logger.error(f"[autosave] 转存失败: {e}")
             return {"success": False, "error": str(e)}
 
+
     async def _get_dlinks(self, save_dir: str, file_names: list = None) -> list:
         loop = asyncio.get_event_loop()
         from concurrent.futures import ThreadPoolExecutor
         return await loop.run_in_executor(ThreadPoolExecutor(max_workers=1), self._get_dlinks_sync, save_dir, file_names)
 
     # ---- 移动文件夹 ----
+
     
     async def _move_folder(self, from_dir: str, to_dir: str) -> bool:
         """用 OpenList API 移动整个文件夹"""
@@ -518,6 +529,7 @@ class BaiduCurlPlugin(Star):
         except Exception as e:
             logger.error(f"[move] 移动失败: {e}")
             return False
+
     
     def _move_folder_sync(self, from_dir: str, to_dir: str) -> bool:
         """扫描百度网盘找最近创建的 sharelink 文件夹并移动"""
@@ -647,6 +659,7 @@ class BaiduCurlPlugin(Star):
         except Exception as e:
             logger.error(f"[move] 移动失败: {e}")
             return False
+
     
     def _move_files_sync(self, files: list, from_dir: str, to_dir: str) -> bool:
         """用 OpenList API 移动文件"""
@@ -716,6 +729,7 @@ class BaiduCurlPlugin(Star):
             return False
     
     # ---- 清理 baidu-autosave 任务 ----
+
     
     async def _cleanup_autosave_task(self, surl: str):
         """删除 baidu-autosave 里的任务"""
