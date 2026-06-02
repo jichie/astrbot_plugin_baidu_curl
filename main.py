@@ -118,6 +118,9 @@ class BaiduCurlPlugin(Star):
                 None,
                 self._scan_files_sync, at, scan_files, self.autosave_dir, save_dir, extra_dirs
             )
+            # 清理临时变量
+            if hasattr(self, '_extra_dirs'):
+                del self._extra_dirs
         
         if not files:
             yield ev.plain_result("❌ 未找到转存的文件")
