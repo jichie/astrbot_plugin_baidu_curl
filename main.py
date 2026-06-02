@@ -19,8 +19,6 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import filter
 from astrbot.api.star import Context, Star
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
-
-
 def _parse(text: str) -> dict:
     r = {"surl": "", "pwd": ""}
     for p in [r"pan\.baidu\.com/s/([a-zA-Z0-9_-]+)", r"surl=([a-zA-Z0-9_-]+)"]:
@@ -38,12 +36,8 @@ def _parse(text: str) -> dict:
             r["pwd"] = m.group(1)
             break
     return r
-
-
 class BaiduCurlPlugin(Star):
     _RE = re.compile(r"https?://pan\.baidu\.com/s/[a-zA-Z0-9_-]+")
-
-
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         cfg = dict(config or {})
@@ -64,8 +58,6 @@ class BaiduCurlPlugin(Star):
         self._refresh_token: str = ""
         self._client_id: str = ""
         self._client_secret: str = ""
-
-
     async def terminate(self):
         pass
 
@@ -94,8 +86,6 @@ class BaiduCurlPlugin(Star):
 
         async for msg in self._run(event, surl, pwd):
             yield msg
-
-
     async def _run(self, ev: AstrMessageEvent, surl: str, pwd: str):
         # 1. baidu-autosave 转存
         yield ev.plain_result("📦 转存中...")
@@ -121,10 +111,10 @@ class BaiduCurlPlugin(Star):
         if token_ok and self._access_token:
             scan_files = autosave_files if autosave_files else None
             at = self._access_token
-            from concurrent.futures import ThreadPoolExecutor
-            loop = asyncio.get_event_loop()
+            
+            loop = asyncio.get_running_loop()
             files, save_dir = await loop.run_in_executor(
-                ThreadPoolExecutor(max_workers=1),
+                None,
                 self._scan_files_sync, at, scan_files
             )
         
@@ -189,8 +179,6 @@ class BaiduCurlPlugin(Star):
         yield ev.plain_result("💡 文件已转存，路径: " + save_dir)
 
     # ---- 从 OpenList 获取凭证并刷新 token ----
-
-
     async def _refresh_access_token(self) -> bool:
         """从 OpenList 加载百度 AccessToken"""
         try:
@@ -211,15 +199,11 @@ class BaiduCurlPlugin(Star):
         except Exception as e:
             logger.error(f"[token] 加载失败: {e}")
         return False
-
-
     
     def _get_dlinks_sync(self, search_dirs: list, file_names: list = None) -> list:
         s = cffi_requests.Session(impersonate="chrome120")
         at = self._access_token
         all_files = []
-
-
         def _list_dir(dir_path):
             """递归列出目录下所有文件"""
             try:
@@ -269,23 +253,19 @@ class BaiduCurlPlugin(Star):
                     dl = dl + "&access_token=" + at
                     dlinks.append({"name": f.get("server_filename", nmap.get(f.get("fs_id"), "?")), "dlink": dl})
         return dlinks
-
-
     async def _autosave(self, surl: str, pwd: str) -> dict:
         """调用 baidu-autosave 服务转存文件（使用 curl_cffi，兼容性更好）"""
         if not self.autosave_url:
             return {"success": False, "error": "未配置 autosave_url"}
         
         try:
-            from concurrent.futures import ThreadPoolExecutor
-            loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(ThreadPoolExecutor(max_workers=1), 
+            
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, 
                 self._autosave_sync, surl, pwd)
         except Exception as e:
             logger.error(f"[autosave] 转存失败: {e}")
             return {"success": False, "error": str(e)}
-
-
     def _scan_files_sync(self, at, scan_files):
         """同步扫描百度网盘文件（在线程池中调用）"""
         files = []
@@ -356,8 +336,6 @@ class BaiduCurlPlugin(Star):
         
         logger.info(f"[scan] 最终文件: {files}, 目录: {save_dir}")
         return files, save_dir
-
-
     def _autosave_sync(self, surl: str, pwd: str) -> dict:
         """同步版本的转存，参考 media_save 插件的实现"""
         try:
@@ -490,11 +468,6 @@ class BaiduCurlPlugin(Star):
             logger.info(f"[autosave] 任务完成，将从百度网盘扫描实际文件")
             
             # 7. 清理任务
-            # 返回成功，但 files 里保存文件名（用于后续匹配）
-            file_names = [f.split("/")[-1] if "/" in f else f for f in transferred_files]
-            return {"success": True, "files": file_names, "save_dir": self.autosave_dir}
-            
-            # 以下代码不再执行
             try:
                 s.post(
                     f"{self.autosave_url}/api/task/delete",
@@ -506,21 +479,16 @@ class BaiduCurlPlugin(Star):
             except Exception:
                 pass
             
-            return {
-                "success": True,
-                "files": transferred_files,
-                "save_dir": save_dir
-            }
-                
+            # 返回成功，files 里保存文件名（用于后续匹配）
+            file_names = [f.split("/")[-1] if "/" in f else f for f in transferred_files]
+            return {"success": True, "files": file_names, "save_dir": self.autosave_dir}
         except Exception as e:
             logger.error(f"[autosave] 转存失败: {e}")
             return {"success": False, "error": str(e)}
-
-
     async def _get_dlinks(self, save_dir: str, file_names: list = None) -> list:
-        loop = asyncio.get_event_loop()
-        from concurrent.futures import ThreadPoolExecutor
-        return await loop.run_in_executor(ThreadPoolExecutor(max_workers=1), self._get_dlinks_sync, save_dir, file_names)
+        loop = asyncio.get_running_loop()
+        
+        return await loop.run_in_executor(None, self._get_dlinks_sync, save_dir, file_names)
 
     # ---- 移动文件夹 ----
 
@@ -532,9 +500,9 @@ class BaiduCurlPlugin(Star):
             return False
         
         try:
-            from concurrent.futures import ThreadPoolExecutor
-            loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(ThreadPoolExecutor(max_workers=1), 
+            
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, 
                 self._move_folder_sync, from_dir, to_dir)
         except Exception as e:
             logger.error(f"[move] 移动失败: {e}")
@@ -746,6 +714,14 @@ class BaiduCurlPlugin(Star):
         if not self.autosave_url:
             return
         
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self._cleanup_sync, surl)
+        except Exception as e:
+            logger.warning(f"[cleanup] 清理任务失败: {e}")
+    
+    def _cleanup_sync(self, surl: str):
+        """同步清理任务（在线程池中执行）"""
         try:
             s = cffi_requests.Session(impersonate="chrome120")
             
