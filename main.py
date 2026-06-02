@@ -111,11 +111,12 @@ class BaiduCurlPlugin(Star):
         if token_ok and self._access_token:
             scan_files = autosave_files if autosave_files else None
             at = self._access_token
+            extra_dirs = getattr(self, '_extra_dirs', [])
             
             loop = asyncio.get_running_loop()
             files, final_dir = await loop.run_in_executor(
                 None,
-                self._scan_files_sync, at, scan_files, self.autosave_dir, save_dir
+                self._scan_files_sync, at, scan_files, self.autosave_dir, save_dir, extra_dirs
             )
         
         if not files:
@@ -269,7 +270,7 @@ class BaiduCurlPlugin(Star):
         except Exception as e:
             logger.error(f"[autosave] 转存失败: {e}")
             return {"success": False, "error": str(e)}
-    def _scan_files_sync(self, at, scan_files, autosave_dir="/来自Bot", actual_dir=None):
+    def _scan_files_sync(self, at, scan_files, autosave_dir="/来自Bot", actual_dir=None, extra_dirs=None):
         """同步扫描百度网盘文件（在线程池中调用）"""
         files = []
         save_dir = autosave_dir
@@ -281,6 +282,8 @@ class BaiduCurlPlugin(Star):
             dirs_to_scan = []
             if actual_dir:
                 dirs_to_scan.append(actual_dir)
+            if extra_dirs:
+                dirs_to_scan.extend(extra_dirs)
             if autosave_dir not in dirs_to_scan:
                 dirs_to_scan.append(autosave_dir)
             
@@ -468,13 +471,18 @@ class BaiduCurlPlugin(Star):
                         parts = first_file.strip("/").split("/")
                         if len(parts) > 1:
                             save_dir = "/" + parts[0]
-                    elif "成功转存到" in msg:
-                        # 从消息里提取实际转存目录
+                    elif "转存到" in msg:
+                        # 从消息里提取所有转存目录
                         import re
-                        match = re.search(r'转存到\s+(/\S+)', msg)
-                        if match:
-                            save_dir = match.group(1)
-                            logger.info(f"[autosave] 从消息提取目录: {save_dir}")
+                        matches = re.findall(r'转存到目录\s+(/\S+)', msg)
+                        if matches:
+                            # 取第一个目录作为主要目录
+                            save_dir = matches[0]
+                            # 保存所有目录用于扫描
+                            if not hasattr(self, '_extra_dirs'):
+                                self._extra_dirs = []
+                            self._extra_dirs = matches[1:]  # 除了第一个以外的目录
+                            logger.info(f"[autosave] 从消息提取目录: {matches}")
                     elif "没有新文件" in msg or "跳过" in msg:
                         logger.info(f"[autosave] 文件已存在，跳过转存")
                         # 清理任务
