@@ -4,45 +4,9 @@
 
 ## 📦 安装方法
 
-### 方法一：通过 AstrBot 插件市场安装（推荐）
-
-1. 打开 AstrBot 管理面板（默认 `http://localhost:6185`）
-2. 进入 **插件管理** 页面
-3. 点击 **插件市场** 标签
-4. 搜索 `百度网盘` 或 `baidu_curl`
-5. 找到 **百度网盘cURL下载助手**，点击 **安装**
-6. 安装完成后重启 AstrBot
-
-### 方法二：通过 GitHub 仓库安装
-
-```bash
-# 进入 AstrBot 插件目录
-cd /AstrBot/data/plugins/
-
-# 克隆插件仓库
-git clone https://github.com/jichie/astrbot_plugin_baidu_curl.git
-
-# 重启 AstrBot
-```
-
-### 方法三：手动安装
-
-1. 下载插件代码：
-   - 点击 [Releases](https://github.com/jichie/astrbot_plugin_baidu_curl/releases) 下载最新版本
-   - 或者点击页面右上角 **Code** → **Download ZIP**
-
-2. 解压到 AstrBot 插件目录：
-   ```
-   /AstrBot/data/plugins/astrbot_plugin_baidu_curl/
-   ```
-
-3. 安装依赖：
-   ```bash
-   cd /AstrBot/data/plugins/astrbot_plugin_baidu_curl/
-   pip install -r requirements.txt
-   ```
-
-4. 重启 AstrBot
+1. 确保已安装 [AstrBot](https://github.com/AstrBotDevs/AstrBot)
+2. 将插件复制到 AstrBot 的插件目录（你也可以使用 AstrBot 的插件管理器安装，或下载本项目上传压缩包）
+3. 重启 AstrBot 或使用热加载命令
 
 ---
 
