@@ -450,6 +450,13 @@ class BaiduCurlPlugin(Star):
                         parts = first_file.strip("/").split("/")
                         if len(parts) > 1:
                             save_dir = "/" + parts[0]
+                    elif "成功转存到" in msg:
+                        # 从消息里提取实际转存目录
+                        import re
+                        match = re.search(r'转存到\s+(/\S+)', msg)
+                        if match:
+                            save_dir = match.group(1)
+                            logger.info(f"[autosave] 从消息提取目录: {save_dir}")
                     elif "没有新文件" in msg or "跳过" in msg:
                         logger.info(f"[autosave] 文件已存在，跳过转存")
                         # 清理任务
