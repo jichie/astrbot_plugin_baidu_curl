@@ -671,6 +671,12 @@ class BaiduCurlPlugin(Star):
                                 self._extra_dirs = []
                             self._extra_dirs = matches[1:]  # 除了第一个以外的目录
                             logger.info(f"[autosave] 从消息提取目录: {matches}")
+                    elif "使用密码" in msg or "访问分享" in msg:
+                        # 密码正确，但 autosave 未返回具体目录，强制后续全面扫描
+                        logger.info(f"[autosave] 使用密码访问成功，将在根目录全面扫描")
+                        if not hasattr(self, '_extra_dirs'):
+                            self._extra_dirs = []
+                        self._extra_dirs.append("/")  # 触发 has_actual_dir，强制扫描
                     elif "没有新文件" in msg or "跳过" in msg:
                         logger.info(f"[autosave] 文件已存在，跳过转存")
                         # 清理任务
