@@ -124,18 +124,13 @@ class BaiduCurlPlugin(Star):
         files = []
         save_dir = tr.get("save_dir", self.autosave_dir)
         
-        if tr.get("existed"):
-            yield ev.plain_result(
-                "ℹ️ 该文件之前已转存，无需重复操作。\n"
-                f"📁 {save_dir}\n"
-                "💡 如需直链，请分享其他链接"
-            )
-            await self._cleanup_autosave_task(surl)
-            return
-
         # 获取 baidu-autosave 返回的文件名（用于匹配）
         autosave_files = tr.get("files", [])
         existed = tr.get("existed", False)
+        # 如果文件已存在，放宽时间过滤确保扫描到
+        if existed:
+            cutoff_time = 0
+            logger.info("[scan] 文件已存在，跳过时间过滤扫描全部文件")
         logger.info(f"[scan] 要匹配的文件: {autosave_files}, 已存在: {existed}")
 
         # 等待转存完成
@@ -803,18 +798,31 @@ class BaiduCurlPlugin(Star):
             exec_data = exec_resp.json()
             logger.info(f"[autosave] 执行响应: {exec_data}")
 
-            # 5. 等待执行完成
-            time.sleep(8)
+            # 5. 等待执行完成（轮询等待，最多约 25 秒）
+            done = False
+            for retry in range(4):
+                time.sleep(6 if retry == 0 else 5)
+                result_resp = s.get(
+                    f"{self.autosave_url}/api/tasks",
+                    headers=headers,
+                    allow_redirects=False,
+                    timeout=15,
+                )
+                result_data = result_resp.json()
+                for task in result_data.get("tasks", []):
+                    if task.get("task_uid") == task_uid:
+                        msg = task.get("message", "") or ""
+                        # 步骤/扫描 是进度消息，继续轮询
+                        if "步骤" in msg or "扫描" in msg:
+                            logger.info(f"[autosave] 任务进行中: {msg}，继续等待...")
+                        else:
+                            logger.info(f"[autosave] 任务结果: msg={msg}, files={task.get('transferred_files', [])}")
+                            done = True
+                        break
+                if done:
+                    break
 
-            # 6. 获取执行结果（直接按 task_uid 查找，不管状态）
-            result_resp = s.get(
-                f"{self.autosave_url}/api/tasks",
-                headers=headers,
-                allow_redirects=False,
-                timeout=15,
-            )
-            result_data = result_resp.json()
-
+            # 6. 解析最终结果
             transferred_files = []
             save_dir = self.autosave_dir
             logger.info(
