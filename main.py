@@ -426,23 +426,37 @@ class BaiduCurlPlugin(Star):
                 )
 
                 # 用文件名匹配（有明确目录时，只取该目录的文件）
-                for f in bot_data.get("list", []):
-                    fname = f.get("server_filename", "")
-                    # 跳过目录
-                    if f.get("isdir"):
-                        continue
-                    if min_mtime and f.get("server_mtime", 0) < min_mtime:
-                        continue
-                    # 如果有明确的转存目录，不按文件名过滤
-                    if (
-                        not has_actual_dir
-                        and scan_files is not None
-                        and fname not in scan_files
-                    ):
-                        continue
-                    files.append(f.get("path", ""))
-                    save_dir = scan_dir
-                    logger.info(f"[scan] 匹配到文件: {fname}")
+                def _scan_dir(dir_path, depth=0):
+                    nonlocal save_dir
+                    if depth > 3:
+                        return
+                    try:
+                        encoded = urllib.parse.quote(dir_path, safe="/")
+                        resp = s.get(
+                            f"https://pan.baidu.com/rest/2.0/xpan/file?method=list&dir={encoded}&dlink=1&web=1&app_id=250528&access_token={at}",
+                            timeout=15,
+                        )
+                        data = resp.json()
+                        for f in data.get("list", []):
+                            fname = f.get("server_filename", "")
+                            if f.get("isdir"):
+                                _scan_dir(f.get("path", ""), depth + 1)
+                                continue
+                            if min_mtime and f.get("server_mtime", 0) < min_mtime:
+                                continue
+                            if (
+                                not has_actual_dir
+                                and scan_files is not None
+                                and fname not in scan_files
+                            ):
+                                continue
+                            files.append(f.get("path", ""))
+                            save_dir = dir_path
+                            logger.info(f"[scan] 匹配到文件: {fname}")
+                    except Exception as e:
+                        logger.warning(f"[scan] 子目录扫描错误: {e}")
+                
+                _scan_dir(scan_dir)
 
                 # 如果是 actual_dir 且找到了文件，不需要继续扫描其他目录
                 if files and scan_dir == actual_dir:
