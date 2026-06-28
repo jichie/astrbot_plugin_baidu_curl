@@ -1,6 +1,6 @@
 name: astrbot_plugin_baidu_curl
 display_name: 百度网盘cURL下载助手
-desc: 发送百度网盘分享链接，自动转存、提取直链并生成cURL下载命令。支持baidu-autosave转存、OpenList集成、文件自动整理。
+desc: 发送百度网盘分享链接，自动转存、提取直链并生成cURL下载命令。支持baidu-autosave转存、OpenList集成、文件自动整理、多文件选择。
 help: |
   使用方法：
   1. 配置 baidu-autosave 地址和账号
@@ -9,10 +9,16 @@ help: |
      https://pan.baidu.com/s/1xxxxxxx 提取码:xxxx
   4. 插件会自动转存、提取直链、整理文件并返回cURL下载命令
 
+  多文件选择（需开启 enable_file_selection）：
+  - 转存后如有多个文件，插件会列出编号列表
+  - 回复数字选择文件（如 1 或 1 3）
+  - 回复 0 或 all 选择全部
+  - 120秒内有效，发送新链接可取消选择
+
   前置依赖：
   - baidu-autosave：百度网盘自动转存服务
   - OpenList/AList：用于获取百度网盘 access_token
-version: v7.2.0
+version: v7.3.0
 author: jichie
 repo: https://github.com/jichie/astrbot_plugin_baidu_curl
 license: MIT

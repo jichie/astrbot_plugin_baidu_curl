@@ -1,6 +1,7 @@
 """
-百度网盘 cURL 下载助手 v7
+百度网盘 cURL 下载助手 v7.3
 baidu-autosave 转存 + refresh_token 刷新 + filemetas API 获取直链
+支持多文件时用户选择要提取直链的文件
 """
 
 from __future__ import annotations
@@ -46,6 +47,7 @@ def _parse(text: str) -> dict:
 
 class BaiduCurlPlugin(Star):
     _RE = re.compile(r"https?://pan\.baidu\.com/s/[a-zA-Z0-9_-]+")
+    _SELECTION_TIMEOUT = 120  # 文件选择超时时间（秒）
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -64,12 +66,16 @@ class BaiduCurlPlugin(Star):
         self.show_curl_command: bool = cfg.get("show_curl_command", True)
         # 文件清理
         self.file_retention_hours: int = int(cfg.get("file_retention_hours", 0) or 0)
+        # 多文件选择
+        self.enable_file_selection: bool = cfg.get("enable_file_selection", True)
         # 缓存
         self._access_token: str = ""
         self._token_expire: float = 0  # token 过期时间戳
         self._refresh_token: str = ""
         self._client_id: str = ""
         self._client_secret: str = ""
+        # 待选择的文件状态: session_id -> {files, save_dir, surl, has_actual_dir, timestamp}
+        self._pending_selections: dict = {}
 
     async def terminate(self):
         pass
@@ -77,6 +83,43 @@ class BaiduCurlPlugin(Star):
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
         text = event.message_str
+        sid = event.session_id
+
+        # ---- 检查是否有待处理的文件选择 ----
+        if sid in self._pending_selections:
+            state = self._pending_selections[sid]
+            # 超时检查
+            if time.time() - state["timestamp"] > self._SELECTION_TIMEOUT:
+                del self._pending_selections[sid]
+                yield event.plain_result("⏰ 文件选择已超时，请重新发送链接")
+                return
+
+            selection_text = text.strip()
+            # 如果是数字选择、all、0、全部、所有
+            if re.match(r"^[\d,\s]+$", selection_text) or selection_text.lower() in (
+                "all",
+                "0",
+                "全部",
+                "所有",
+            ):
+                async for msg in self._handle_selection(event, selection_text):
+                    yield msg
+                return
+
+            # 如果是新的分享链接，取消上次选择，继续处理新链接
+            if self._RE.search(text):
+                del self._pending_selections[sid]
+                yield event.plain_result("ℹ️ 已取消上次的文件选择，开始处理新链接...")
+                # 继续往下处理新链接（不 return）
+            else:
+                # 非选择消息，忽略但保持等待状态
+                yield event.plain_result(
+                    "⏳ 请回复数字选择文件（1-"
+                    + str(len(state["files"]))
+                    + "），多个用空格/逗号分隔\n回复 0 或 all 选择全部\n回复分享链接可取消选择"
+                )
+                return
+
         # 如果是影视转存命令，跳过（由 media_save 插件处理）
         if re.match(
             r"^(电影|电视剧|动漫|综艺|纪录片|movie|tv|anime|动画|转存)", text.strip()
@@ -123,7 +166,7 @@ class BaiduCurlPlugin(Star):
         # 2. 用文件名在百度网盘里匹配
         files = []
         save_dir = tr.get("save_dir", self.autosave_dir)
-        
+
         # 获取 baidu-autosave 返回的文件名（用于匹配）
         autosave_files = tr.get("files", [])
         existed = tr.get("existed", False)
@@ -172,14 +215,115 @@ class BaiduCurlPlugin(Star):
             yield ev.plain_result("❌ 未找到转存的文件")
             return
 
+        # 3. 显示转存成功
+        file_names = [f.split("/")[-1] for f in files]
         yield ev.plain_result(
             "✅ 转存成功！\n📁 "
             + save_dir
             + "\n📄 "
-            + (", ".join([f.split("/")[-1] for f in files]))
+            + (", ".join(file_names))
         )
 
-        # 3. 获取直链
+        # 4. 多文件选择
+        if self.enable_file_selection and len(files) > 1:
+            # 构建编号列表
+            lines = []
+            for i, f in enumerate(files, 1):
+                lines.append(f"{i}. {f.split('/')[-1]}")
+
+            # 存储待选择状态
+            self._pending_selections[ev.session_id] = {
+                "files": files,
+                "save_dir": save_dir,
+                "surl": surl,
+                "has_actual_dir": has_actual_dir,
+                "timestamp": time.time(),
+            }
+
+            yield ev.plain_result(
+                f"📂 共找到 {len(files)} 个文件，请选择要提取直链的文件：\n\n"
+                + "\n".join(lines)
+                + "\n\n💡 回复数字选择（多个用空格/逗号分隔，如 1 3）\n"
+                + "💡 回复 0 或 all 选择全部\n"
+                + f"⏱️ {self._SELECTION_TIMEOUT}秒内有效"
+            )
+            return  # 等待用户选择
+
+        # 单文件或未启用选择：直接提取直链
+        async for msg in self._run_dlinks(ev, files, save_dir, surl, has_actual_dir):
+            yield msg
+
+    async def _handle_selection(self, ev: AstrMessageEvent, selection_text: str):
+        """处理用户的多文件选择"""
+        sid = ev.session_id
+        state = self._pending_selections.get(sid)
+        if not state:
+            yield ev.plain_result("❌ 没有待选择的文件，请重新发送链接")
+            return
+
+        # 超时检查
+        if time.time() - state["timestamp"] > self._SELECTION_TIMEOUT:
+            del self._pending_selections[sid]
+            yield ev.plain_result("⏰ 文件选择已超时，请重新发送链接")
+            return
+
+        all_files = state["files"]
+        save_dir = state["save_dir"]
+        surl = state["surl"]
+        has_actual_dir = state["has_actual_dir"]
+
+        # 解析选择
+        selected = []
+        text_lower = selection_text.strip().lower()
+
+        if text_lower in ("0", "all", "全部", "所有"):
+            selected = all_files
+        else:
+            # 解析数字
+            nums = re.split(r"[,\s]+", text_lower)
+            indices = []
+            for n in nums:
+                n = n.strip()
+                if n.isdigit():
+                    idx = int(n)
+                    if 1 <= idx <= len(all_files):
+                        indices.append(idx - 1)
+
+            if not indices:
+                yield ev.plain_result(
+                    f"❌ 无效的选择，请回复数字（1-{len(all_files)}）\n"
+                    + "多个用空格/逗号分隔，回复 0 或 all 选择全部"
+                )
+                return
+
+            # 去重
+            indices = sorted(set(indices))
+            selected = [all_files[i] for i in indices]
+
+        # 清理待选择状态
+        del self._pending_selections[sid]
+
+        # 显示已选文件
+        selected_names = [f.split("/")[-1] for f in selected]
+        yield ev.plain_result(
+            f"📋 已选择 {len(selected)} 个文件：\n" + "\n".join(selected_names)
+        )
+
+        # 继续提取直链
+        async for msg in self._run_dlinks(
+            ev, selected, save_dir, surl, has_actual_dir
+        ):
+            yield msg
+
+    async def _run_dlinks(
+        self,
+        ev: AstrMessageEvent,
+        files: list,
+        save_dir: str,
+        surl: str,
+        has_actual_dir: bool,
+    ):
+        """提取直链、移动文件夹、清理（从 _run 分离，可被选择流程复用）"""
         search_dirs = set()
         search_dirs.add(save_dir)
         for f in files:
@@ -194,7 +338,7 @@ class BaiduCurlPlugin(Star):
             if not token_ok:
                 yield ev.plain_result("⚠️ token 刷新失败")
 
-            # 3. 用 filemetas API 获取直链
+            # 用 filemetas API 获取直链
             yield ev.plain_result("🔗 获取百度直链...")
             dlinks = await self._get_dlinks(list(search_dirs), files)
             if dlinks:
@@ -211,7 +355,7 @@ class BaiduCurlPlugin(Star):
                             + '"'
                         )
                         out.append("📄 " + dl["name"] + ":\n```\n" + cmd + "\n```")
-                # 4. 移动文件夹到 /来自Bot
+                # 移动文件夹到 /来自Bot
                 move_msg = ""
                 yield ev.plain_result("📁 移动文件夹到 " + self.autosave_dir + "...")
                 # 先移动实际转存目录（如 /2024/202402/20240205）
@@ -233,7 +377,7 @@ class BaiduCurlPlugin(Star):
                 elif not move_msg:
                     move_msg = "\n\n⚠️ 移动失败"
 
-                # 5. 清理 baidu-autosave 任务和空日期目录
+                # 清理 baidu-autosave 任务和空日期目录
                 await self._cleanup_autosave_task(surl)
                 if has_actual_dir and save_dir and "/sharelink" not in save_dir:
                     await self._cleanup_date_dirs(save_dir)
@@ -455,7 +599,7 @@ class BaiduCurlPlugin(Star):
                             logger.info(f"[scan] 匹配到文件: {fname}")
                     except Exception as e:
                         logger.warning(f"[scan] 子目录扫描错误: {e}")
-                
+
                 _scan_dir(scan_dir)
 
                 # 如果是 actual_dir 且找到了文件，不需要继续扫描其他目录

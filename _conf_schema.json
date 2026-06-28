@@ -1,4 +1,10 @@
 {
+    "enable_file_selection": {
+        "description": "多文件时允许选择",
+        "hint": "转存后如有多个文件，让用户选择要提取直链的文件。关闭则全部提取直链（原行为）",
+        "type": "bool",
+        "default": true
+    },
     "show_curl_command": {
         "description": "显示cURL命令",
         "hint": "是否显示完整的cURL下载命令",
