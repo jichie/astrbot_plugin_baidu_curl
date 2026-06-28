@@ -115,7 +115,7 @@ class BaiduCurlPlugin(Star):
                 # 非选择消息，忽略但保持等待状态
                 yield event.plain_result(
                     "⏳ 请回复数字选择文件（1-"
-                    + str(len(state["files"]))
+                    + str(len(state["share_files"]))
                     + "），多个用空格/逗号分隔\n回复 0 或 all 选择全部\n回复分享链接可取消选择"
                 )
                 return
@@ -156,95 +156,30 @@ class BaiduCurlPlugin(Star):
             yield msg
 
     async def _run(self, ev: AstrMessageEvent, surl: str, pwd: str):
-        # 1. 内置转存
-        yield ev.plain_result("📦 转存中...")
-        cutoff_time = (
-            int(time.time()) - 60
-        )  # 记录转存前时间（60s buffer），后续只匹配此后的文件
-        tr = await self._builtin_transfer(surl, pwd)
-        if not tr.get("success"):
-            yield ev.plain_result("❌ 转存失败: " + tr.get("error", "未知"))
+        # 1. 列出分享文件（不转存）
+        yield ev.plain_result("📋 获取分享文件列表...")
+        lr = await self._list_share_files(surl, pwd)
+        if not lr.get("success"):
+            yield ev.plain_result("❌ " + lr.get("error", "未知"))
             return
 
-        # 2. 用文件名在百度网盘里匹配
-        files = []
-        save_dir = tr.get("save_dir", self.save_dir)
+        share_files = lr["files"]  # [{name, fs_id, path}]
 
-        # 获取转存返回的文件名（用于匹配）
-        transfer_files = tr.get("files", [])
-        existed = tr.get("existed", False)
-        # 如果文件已存在，放宽时间过滤确保扫描到
-        if existed:
-            cutoff_time = 0
-            logger.info("[scan] 文件已存在，跳过时间过滤扫描全部文件")
-        logger.info(f"[scan] 要匹配的文件: {transfer_files}, 已存在: {existed}")
-
-        # 等待转存完成
-        await asyncio.sleep(5)
-
-        # 用百度网盘 API 扫描并匹配文件（在线程池中执行避免阻塞）
-        extra_dirs = getattr(self, "_extra_dirs", [])
-        has_actual_dir = bool(save_dir != self.save_dir or extra_dirs)
-
-        token_ok = await self._refresh_access_token()
-        if token_ok and self._access_token:
-            scan_files = transfer_files if transfer_files else None
-            at = self._access_token
-
-            logger.info(
-                f"[scan] save_dir={save_dir}, save_dir_cfg={self.save_dir}, has_actual_dir={has_actual_dir}, extra_dirs={extra_dirs}"
-            )
-
-            loop = asyncio.get_running_loop()
-            files, final_dir = await loop.run_in_executor(
-                None,
-                self._scan_files_sync,
-                at,
-                scan_files,
-                self.save_dir,
-                save_dir,
-                extra_dirs,
-                has_actual_dir,
-                cutoff_time,
-            )
-            # 用扫描到的实际目录更新 save_dir
-            if final_dir:
-                save_dir = final_dir
-            # 清理临时变量
-            if hasattr(self, "_extra_dirs"):
-                del self._extra_dirs
-
-        if not files:
-            yield ev.plain_result("❌ 未找到转存的文件")
-            return
-
-        # 3. 显示转存成功
-        file_names = [f.split("/")[-1] for f in files]
-        yield ev.plain_result(
-            "✅ 转存成功！\n📁 "
-            + save_dir
-            + "\n📄 "
-            + (", ".join(file_names))
-        )
-
-        # 4. 多文件选择
-        if self.enable_file_selection and len(files) > 1:
-            # 构建编号列表
+        # 2. 多文件选择
+        if self.enable_file_selection and len(share_files) > 1:
             lines = []
-            for i, f in enumerate(files, 1):
-                lines.append(f"{i}. {f.split('/')[-1]}")
+            for i, f in enumerate(share_files, 1):
+                lines.append(f"{i}. {f['name']}")
 
-            # 存储待选择状态
             self._pending_selections[ev.session_id] = {
-                "files": files,
-                "save_dir": save_dir,
+                "share_files": share_files,
                 "surl": surl,
-                "has_actual_dir": has_actual_dir,
+                "pwd": pwd,
                 "timestamp": time.time(),
             }
 
             yield ev.plain_result(
-                f"📂 共找到 {len(files)} 个文件，请选择要提取直链的文件：\n\n"
+                f"📂 共 {len(share_files)} 个文件，请选择要转存并提取直链的文件：\n\n"
                 + "\n".join(lines)
                 + "\n\n💡 回复数字选择（多个用空格/逗号分隔，如 1 3）\n"
                 + "💡 回复 0 或 all 选择全部\n"
@@ -252,8 +187,9 @@ class BaiduCurlPlugin(Star):
             )
             return  # 等待用户选择
 
-        # 单文件或未启用选择：直接提取直链
-        async for msg in self._run_dlinks(ev, files, save_dir, surl, has_actual_dir):
+        # 单文件或未启用选择：直接转存全部
+        selected_indices = list(range(len(share_files)))
+        async for msg in self._do_transfer_and_dlinks(ev, surl, pwd, share_files, selected_indices):
             yield msg
 
     async def _handle_selection(self, ev: AstrMessageEvent, selection_text: str):
@@ -270,52 +206,108 @@ class BaiduCurlPlugin(Star):
             yield ev.plain_result("⏰ 文件选择已超时，请重新发送链接")
             return
 
-        all_files = state["files"]
-        save_dir = state["save_dir"]
+        share_files = state["share_files"]
         surl = state["surl"]
-        has_actual_dir = state["has_actual_dir"]
+        pwd = state["pwd"]
 
         # 解析选择
-        selected = []
         text_lower = selection_text.strip().lower()
+        indices = []
 
         if text_lower in ("0", "all", "全部", "所有"):
-            selected = all_files
+            indices = list(range(len(share_files)))
         else:
-            # 解析数字
             nums = re.split(r"[,\s]+", text_lower)
-            indices = []
             for n in nums:
                 n = n.strip()
                 if n.isdigit():
                     idx = int(n)
-                    if 1 <= idx <= len(all_files):
+                    if 1 <= idx <= len(share_files):
                         indices.append(idx - 1)
 
             if not indices:
                 yield ev.plain_result(
-                    f"❌ 无效的选择，请回复数字（1-{len(all_files)}）\n"
+                    f"❌ 无效的选择，请回复数字（1-{len(share_files)}）\n"
                     + "多个用空格/逗号分隔，回复 0 或 all 选择全部"
                 )
                 return
 
-            # 去重
             indices = sorted(set(indices))
-            selected = [all_files[i] for i in indices]
 
         # 清理待选择状态
         del self._pending_selections[sid]
 
         # 显示已选文件
-        selected_names = [f.split("/")[-1] for f in selected]
+        selected_names = [share_files[i]["name"] for i in indices]
         yield ev.plain_result(
-            f"📋 已选择 {len(selected)} 个文件：\n" + "\n".join(selected_names)
+            f"📋 已选择 {len(indices)} 个文件：\n" + "\n".join(selected_names)
         )
 
-        # 继续提取直链
-        async for msg in self._run_dlinks(
-            ev, selected, save_dir, surl, has_actual_dir
-        ):
+        # 转存选中的文件并提取直链
+        async for msg in self._do_transfer_and_dlinks(ev, surl, pwd, share_files, indices):
+            yield msg
+
+    async def _do_transfer_and_dlinks(
+        self,
+        ev: AstrMessageEvent,
+        surl: str,
+        pwd: str,
+        share_files: list,
+        selected_indices: list,
+    ):
+        """转存选中的文件，然后提取直链、移动、清理"""
+        # 1. 转存
+        yield ev.plain_result("📦 转存中...")
+        tr = await self._transfer_selected_files(surl, pwd, selected_indices)
+        if not tr.get("success"):
+            yield ev.plain_result("❌ 转存失败: " + tr.get("error", "未知"))
+            return
+
+        save_dir = tr.get("save_dir", self.save_dir)
+        transfer_files = tr.get("files", [])
+        existed = tr.get("existed", False)
+
+        yield ev.plain_result(
+            "✅ 转存成功！\n📁 " + save_dir + "\n📄 " + ", ".join(transfer_files)
+        )
+
+        # 2. 等待转存完成
+        await asyncio.sleep(3)
+
+        # 3. 用文件名在百度网盘里匹配（扫描确认）
+        cutoff_time = 0 if existed else (int(time.time()) - 60)
+        if existed:
+            logger.info("[scan] 文件已存在，跳过时间过滤")
+        logger.info(f"[scan] 要匹配的文件: {transfer_files}, 已存在: {existed}")
+
+        files = []
+        has_actual_dir = False
+
+        token_ok = await self._refresh_access_token()
+        if token_ok and self._access_token:
+            scan_files = transfer_files if transfer_files else None
+            at = self._access_token
+            loop = asyncio.get_running_loop()
+            files, final_dir = await loop.run_in_executor(
+                None,
+                self._scan_files_sync,
+                at,
+                scan_files,
+                self.save_dir,
+                save_dir,
+                [],
+                has_actual_dir,
+                cutoff_time,
+            )
+            if final_dir:
+                save_dir = final_dir
+
+        if not files:
+            # 扫描不到就用转存返回的文件名兜底
+            files = [f"{save_dir}/{fn}" for fn in transfer_files]
+
+        # 4. 提取直链
+        async for msg in self._run_dlinks(ev, files, save_dir, surl, has_actual_dir):
             yield msg
 
     async def _run_dlinks(
@@ -838,12 +830,23 @@ class BaiduCurlPlugin(Star):
 
     # ==================== 内置转存（BDUSS Cookie） ====================
 
-    async def _builtin_transfer(self, surl: str, pwd: str) -> dict:
-        """内置转存：用 BDUSS Cookie 直接调用百度网盘 API 转存分享文件"""
+    async def _list_share_files(self, surl: str, pwd: str) -> dict:
+        """列出分享文件（不转存）"""
         try:
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(
-                None, self._builtin_transfer_sync, surl, pwd
+                None, self._list_share_files_sync, surl, pwd
+            )
+        except Exception as e:
+            logger.error(f"[builtin] 列出分享文件失败: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def _transfer_selected_files(self, surl: str, pwd: str, selected_indices: list) -> dict:
+        """转存选中的文件"""
+        try:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                None, self._transfer_files_sync, surl, pwd, selected_indices
             )
         except Exception as e:
             logger.error(f"[builtin] 转存失败: {e}")
@@ -862,14 +865,16 @@ class BaiduCurlPlugin(Star):
                 cookies[key.strip()] = value.strip()
         return cookies
 
-    def _builtin_transfer_sync(self, surl: str, pwd: str) -> dict:
-        """同步内置转存（在线程池中执行）
+    def _list_share_files_sync(self, surl: str, pwd: str) -> dict:
+        """列出分享中的所有文件（不转存）
 
         流程:
         1. 用 Cookie 访问分享链接，验证密码（如有）
         2. 解析分享页面获取文件列表
-        3. 递归列出文件夹内容，收集所有文件的 fs_id
-        4. 调用 share/transfer 接口转存到指定目录
+        3. 递归列出文件夹内容，收集所有文件信息
+
+        Returns:
+            dict: {success, files: [{name, fs_id, path}], uk, share_id, bdstoken, share_url}
         """
         try:
             s = cffi_requests.Session(impersonate="chrome120")
@@ -880,9 +885,8 @@ class BaiduCurlPlugin(Star):
                 return {"success": False, "error": "Cookie 中缺少 BDUSS，请检查 Cookie 是否正确"}
             if not cookies.get("STOKEN"):
                 logger.warning("[builtin] Cookie 中缺少 STOKEN，部分分享可能无法转存")
-            # 设置所有 Cookie（完整 Cookie 兼容性更好）
             for k, v in cookies.items():
-                if v:  # 跳过空值如 TWIE=''
+                if v:
                     s.cookies.set(k, v)
 
             share_url = f"https://pan.baidu.com/s/1{surl}"
@@ -922,13 +926,10 @@ class BaiduCurlPlugin(Star):
             resp = s.get(share_url, timeout=15)
             html = resp.text
 
-            # 解析 yunData.setData({...}) 或 locals.mset({...})
             match = re.search(r"(?:yunData\.setData|locals\.mset)\(", html)
             if not match:
-                # 尝试从页面中提取 JSON 数据（兼容新版本页面）
                 return {"success": False, "error": "无法解析分享页面，可能 Cookie 已过期或分享已失效"}
 
-            # 用花括号匹配找到完整 JSON
             start = match.end()
             brace_count = 0
             end = start
@@ -953,7 +954,6 @@ class BaiduCurlPlugin(Star):
             if not uk or not share_id:
                 return {"success": False, "error": "无法获取分享信息 (uk/shareid 为空)"}
 
-            # 提取文件列表
             file_list_raw = shared_data.get("file_list", {})
             if isinstance(file_list_raw, list):
                 root_files = file_list_raw
@@ -967,14 +967,12 @@ class BaiduCurlPlugin(Star):
 
             logger.info(f"[builtin] 分享根目录有 {len(root_files)} 项, uk={uk}, share_id={share_id}")
 
-            # ---- 步骤3: 递归收集所有文件的 fs_id ----
-            all_fs_ids = []
-            all_file_names = []
+            # ---- 步骤3: 递归收集所有文件信息 ----
+            all_files = []  # [{name, fs_id, path}]
 
             def _collect_files(file_items):
                 for f in file_items:
                     if f.get("isdir") == 1:
-                        # 递归列出子目录
                         dir_path = f.get("path", "")
                         logger.info(f"[builtin] 列出共享目录: {dir_path}")
                         sub_files = self._list_shared_dir_builtin(
@@ -984,24 +982,97 @@ class BaiduCurlPlugin(Star):
                     else:
                         fs_id = f.get("fs_id")
                         if fs_id:
-                            all_fs_ids.append(fs_id)
                             name = f.get("server_filename") or f.get("path", "").split("/")[-1]
-                            all_file_names.append(name)
+                            path = f.get("path", name)
+                            all_files.append({"name": name, "fs_id": fs_id, "path": path})
                             logger.info(f"[builtin] 记录文件: {name}")
 
             _collect_files(root_files)
 
-            if not all_fs_ids:
+            if not all_files:
                 return {"success": False, "error": "没有可转存的文件（可能全是空文件夹）"}
 
-            logger.info(f"[builtin] 共 {len(all_fs_ids)} 个文件待转存")
+            logger.info(f"[builtin] 共 {len(all_files)} 个文件")
 
-            # ---- 步骤4: 调用 transfer API 转存 ----
+            return {
+                "success": True,
+                "files": all_files,
+                "uk": uk,
+                "share_id": share_id,
+                "bdstoken": bdstoken,
+                "share_url": share_url,
+            }
+
+        except Exception as e:
+            logger.error(f"[builtin] 列出分享文件异常: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _transfer_files_sync(self, surl: str, pwd: str, selected_indices: list) -> dict:
+        """转存选中的文件
+
+        Args:
+            surl: 分享 surl
+            pwd: 提取码
+            selected_indices: 选中的文件索引列表（对应 _list_share_files 返回的 files 列表）
+        """
+        try:
+            # 先列出文件获取 uk/share_id/bdstoken
+            lr = self._list_share_files_sync(surl, pwd)
+            if not lr.get("success"):
+                return lr
+
+            all_files = lr["files"]
+            uk = lr["uk"]
+            share_id = lr["share_id"]
+            bdstoken = lr["bdstoken"]
+            share_url = lr["share_url"]
+
+            # 筛选选中的文件
+            selected = []
+            for idx in selected_indices:
+                if 0 <= idx < len(all_files):
+                    selected.append(all_files[idx])
+
+            if not selected:
+                return {"success": False, "error": "没有选中任何文件"}
+
+            fs_ids = [f["fs_id"] for f in selected]
+            file_names = [f["name"] for f in selected]
+
+            logger.info(f"[builtin] 转存 {len(fs_ids)} 个选中文件: {file_names}")
+
+            # 创建 session 并设置 cookie
+            s = cffi_requests.Session(impersonate="chrome120")
+            cookies = self._parse_cookie_string(self.baidu_cookies)
+            for k, v in cookies.items():
+                if v:
+                    s.cookies.set(k, v)
+
+            # 重新验证密码（transfer 需要验证后的 cookie）
+            if pwd:
+                init_url = f"https://pan.baidu.com/share/init?surl={surl}"
+                params = {
+                    "surl": surl,
+                    "t": str(int(time.time() * 1000)),
+                    "channel": "chunlei",
+                    "web": "1",
+                    "bdstoken": "null",
+                    "clienttype": "0",
+                    "app_id": "250528",
+                }
+                s.post(
+                    "https://pan.baidu.com/share/verify",
+                    params=params,
+                    data={"pwd": pwd, "vcode": "", "vcode_str": ""},
+                    headers={"Referer": init_url},
+                    timeout=15,
+                )
+
+            # 确保目标目录存在
             save_dir = self.save_dir
-
-            # 先确保目标目录存在
             self._ensure_dir_exists(s, save_dir)
 
+            # 调用 transfer API
             transfer_params = {
                 "shareid": str(share_id),
                 "from": str(uk),
@@ -1012,7 +1083,7 @@ class BaiduCurlPlugin(Star):
                 "app_id": "250528",
             }
             transfer_data = {
-                "fsidlist": json.dumps(all_fs_ids),
+                "fsidlist": json.dumps(fs_ids),
                 "path": save_dir,
             }
             transfer_headers = {
@@ -1035,24 +1106,22 @@ class BaiduCurlPlugin(Star):
 
             errno = result.get("errno", -1)
 
-            # errno 0 = 成功, 4 = 文件已存在, 12 = 部分已存在, -33 = 全部已存在
             if errno == 0:
                 transferred = []
                 for item in result.get("info", []):
                     if item.get("errno") == 0:
                         transferred.append(item.get("path", "").split("/")[-1])
-                file_names = transferred if transferred else all_file_names
+                file_names = transferred if transferred else file_names
                 return {
                     "success": True,
                     "files": file_names,
                     "save_dir": save_dir,
                 }
             elif errno in (4, 12, -33):
-                # 文件已存在
-                logger.info(f"[builtin] 文件已存在(errno={errno})，跳过转存")
+                logger.info(f"[builtin] 文件已存在(errno={errno})")
                 return {
                     "success": True,
-                    "files": all_file_names,
+                    "files": file_names,
                     "save_dir": save_dir,
                     "existed": True,
                 }
@@ -1061,15 +1130,10 @@ class BaiduCurlPlugin(Star):
             elif errno == -130:
                 return {"success": False, "error": "转存失败: 分享已失效或被取消"}
             else:
-                # 检查 info 中是否有部分成功
                 partial = [item for item in result.get("info", []) if item.get("errno") == 0]
                 if partial:
                     file_names = [item.get("path", "").split("/")[-1] for item in partial]
-                    return {
-                        "success": True,
-                        "files": file_names,
-                        "save_dir": save_dir,
-                    }
+                    return {"success": True, "files": file_names, "save_dir": save_dir}
                 return {"success": False, "error": f"转存失败 (errno={errno})"}
 
         except Exception as e:

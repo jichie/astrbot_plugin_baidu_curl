@@ -21,7 +21,7 @@ help: |
   前置依赖：
   - 百度网盘 Cookie（BDUSS + STOKEN）
   - OpenList/AList：用于获取百度网盘 access_token
-version: v8.1.0
+version: v8.2.0
 author: jichie
 repo: https://github.com/jichie/astrbot_plugin_baidu_curl
 license: MIT
