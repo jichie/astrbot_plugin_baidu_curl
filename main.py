@@ -318,6 +318,7 @@ class BaiduCurlPlugin(Star):
         logger.info(f"[scan] 要匹配的文件: {transfer_files}, 已存在: {existed}")
 
         files = []
+        was_cached = bool(self._access_token and self._token_expire and time.time() < self._token_expire)
 
         token_ok = await self._refresh_access_token()
         if token_ok and self._access_token:
@@ -336,6 +337,28 @@ class BaiduCurlPlugin(Star):
             )
             if final_dir:
                 save_dir = final_dir
+
+        # 如果使用了缓存 token 但扫描结果为空，可能是 token 已失效，重试一次
+        if not files and was_cached and transfer_files:
+            logger.warning("[scan] 缓存 token 扫描结果为空，可能 token 已失效，重新获取...")
+            self._invalidate_token()
+            token_ok = await self._refresh_access_token()
+            if token_ok and self._access_token:
+                scan_files = transfer_files if transfer_files else None
+                at = self._access_token
+                loop = asyncio.get_running_loop()
+                files, final_dir = await loop.run_in_executor(
+                    None,
+                    self._scan_files_sync,
+                    at,
+                    scan_files,
+                    self.save_dir,
+                    save_dir,
+                    [],
+                    cutoff_time,
+                )
+                if final_dir:
+                    save_dir = final_dir
 
         if not files:
             # 扫描不到就用转存返回的文件名兜底
@@ -363,6 +386,7 @@ class BaiduCurlPlugin(Star):
 
         if self.openlist_url and self.openlist_user:
             yield ev.plain_result("🔑 刷新百度 token...")
+            was_cached = bool(self._access_token and self._token_expire and time.time() < self._token_expire)
             token_ok = await self._refresh_access_token()
             if not token_ok:
                 yield ev.plain_result("⚠️ token 刷新失败")
@@ -370,6 +394,16 @@ class BaiduCurlPlugin(Star):
             # 用 filemetas API 获取直链
             yield ev.plain_result("🔗 获取百度直链...")
             dlinks = await self._get_dlinks(list(search_dirs), files)
+
+            # 如果使用了缓存 token 但获取直链为空，可能 token 已失效，重试一次
+            if not dlinks and was_cached and files:
+                logger.warning("[dlink] 缓存 token 获取直链为空，可能 token 已失效，重新获取...")
+                self._invalidate_token()
+                token_ok = await self._refresh_access_token()
+                if token_ok and self._access_token:
+                    yield ev.plain_result("🔗 重试获取百度直链...")
+                    dlinks = await self._get_dlinks(list(search_dirs), files)
+
             if dlinks:
                 out = []
                 if self.show_curl_command:
@@ -467,6 +501,12 @@ class BaiduCurlPlugin(Star):
         except Exception as e:
             logger.exception(f"[token] 加载失败: {e}")
         return False
+
+    def _invalidate_token(self):
+        """清除 token 缓存（当 API 返回 -6 认证失败时调用）"""
+        self._access_token = ""
+        self._token_expire = 0
+        logger.info("[token] 缓存已失效，下次将重新获取")
 
     def _get_dlinks_sync(self, search_dirs: list, file_names: list = None) -> list:
         s = cffi_requests.Session(impersonate="chrome120")
