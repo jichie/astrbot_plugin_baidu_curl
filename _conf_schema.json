@@ -56,5 +56,37 @@
         "hint": "/来自Bot 中超过此时长的文件将被自动删除。设为 0 则禁用",
         "type": "int",
         "default": 0
+    },
+    "push_mode": {
+        "description": "推送模式",
+        "hint": "选择直链提取后如何处理：只提取直链 / 直接推送到下载器 / 显示直链后询问是否推送",
+        "type": "string",
+        "options": ["link_only", "push_only", "link_and_push"],
+        "labels": ["只提取直链", "直接推送到下载器", "提取直链并推送到下载器"],
+        "default": "link_only"
+    },
+    "push_whitelist": {
+        "description": "推送白名单",
+        "hint": "⚠️ 允许使用推送功能的 session_id 列表（群号/用户ID），与 allow_sessions 相互独立。留空则所有会话均禁止推送",
+        "type": "list",
+        "default": []
+    },
+    "motrix_rpc_url": {
+        "description": "Motrix RPC 地址",
+        "hint": "完整 RPC 地址，如 http://127.0.0.1:16800/jsonrpc。Motrix 需在设置中开启 RPC 服务。留空则禁用 Motrix 推送",
+        "type": "string",
+        "default": ""
+    },
+    "motrix_rpc_token": {
+        "description": "Motrix RPC 密钥",
+        "hint": "Motrix 设置 → RPC 服务 → RPC 密钥，没有则留空",
+        "type": "string",
+        "default": ""
+    },
+    "motrix_download_dir": {
+        "description": "Motrix 下载保存目录",
+        "hint": "如 /downloads，留空使用 Motrix 默认下载目录",
+        "type": "string",
+        "default": ""
     }
 }

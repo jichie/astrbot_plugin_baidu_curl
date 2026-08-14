@@ -49,6 +49,9 @@ def _parse(text: str) -> dict:
 class BaiduCurlPlugin(Star):
     _RE = re.compile(r"https?://pan\.baidu\.com/s/[a-zA-Z0-9_-]+")
     _SELECTION_TIMEOUT = 120  # 文件选择超时时间（秒）
+    _PUSH_TIMEOUT = 60  # 推送确认超时时间（秒）
+    # 推送下载器时携带的 User-Agent（与插件生成的 cURL 命令一致，百度网盘会员不限速关键）
+    _PUSH_UA = "pan.baidu.com"
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -69,12 +72,24 @@ class BaiduCurlPlugin(Star):
         self.enable_file_selection: bool = cfg.get("enable_file_selection", True)
         # 百度网盘 Cookie
         self.baidu_cookies: str = cfg.get("baidu_cookies", "")
+        # ---- 下载器推送 ----
+        # 推送模式: link_only=只提取直链 / push_only=提取后直接推送 / link_and_push=显示直链后询问是否推送
+        self.push_mode: str = cfg.get("push_mode", "link_only")
+        # 推送白名单（独立于 allow_sessions，仅白名单内会话可触发推送）
+        self.push_whitelist: list = cfg.get("push_whitelist", [])
+        # Motrix（aria2 RPC）
+        self.motrix_rpc_url: str = cfg.get("motrix_rpc_url", "").strip()
+        self.motrix_rpc_token: str = cfg.get("motrix_rpc_token", "")
+        self.motrix_download_dir: str = cfg.get("motrix_download_dir", "")
         # 缓存
         self._access_token: str = ""
         self._token_expire: float = 0  # token 过期时间戳
         # 待选择的文件状态: session_id -> {share_files, surl, pwd, uk, share_id, bdstoken, timestamp}
         self._pending_selections: dict = {}
         self._selection_lock = asyncio.Lock()
+        # 待推送确认的状态: session_id -> {dlinks, timestamp}
+        self._pending_pushes: dict = {}
+        self._push_lock = asyncio.Lock()
 
     async def terminate(self):
         pass
@@ -94,6 +109,21 @@ class BaiduCurlPlugin(Star):
         """原子设置 sid 的待选择状态"""
         async with self._selection_lock:
             self._pending_selections[sid] = state
+
+    async def _get_pending_push(self, sid: str):
+        """原子读取 sid 的待推送确认状态（不删除）"""
+        async with self._push_lock:
+            return self._pending_pushes.get(sid)
+
+    async def _remove_pending_push(self, sid: str):
+        """原子删除 sid 的待推送确认状态"""
+        async with self._push_lock:
+            self._pending_pushes.pop(sid, None)
+
+    async def _set_pending_push(self, sid: str, state: dict):
+        """原子设置 sid 的待推送确认状态"""
+        async with self._push_lock:
+            self._pending_pushes[sid] = state
 
 
     @filter.event_message_type(filter.EventMessageType.ALL)
@@ -133,6 +163,38 @@ class BaiduCurlPlugin(Star):
                     "⏳ 请回复数字选择文件（1-"
                     + str(len(state["share_files"]))
                     + "），多个用空格/逗号分隔\n回复 0 或 all 选择全部\n回复分享链接可取消选择"
+                )
+                return
+
+        # ---- 检查是否有待推送确认（link_and_push 模式）----
+        pstate = await self._get_pending_push(sid)
+        if pstate:
+            # 超时检查
+            if time.time() - pstate["timestamp"] > self._PUSH_TIMEOUT:
+                await self._remove_pending_push(sid)
+                yield event.plain_result("⏰ 推送确认已超时，可重新发送链接")
+                return
+
+            # 如果是新的分享链接，取消上次推送确认，继续处理新链接
+            if self._RE.search(text):
+                await self._remove_pending_push(sid)
+                yield event.plain_result("ℹ️ 已取消上次的推送确认，开始处理新链接...")
+                # 继续往下处理新链接（不 return）
+            else:
+                ans = text.strip().lower()
+                if ans in ("y", "yes", "是", "要", "好的", "ok", "推送", "推"):
+                    await self._remove_pending_push(sid)
+                    async for msg in self._do_push(event, pstate["dlinks"]):
+                        yield msg
+                    return
+                if ans in ("n", "no", "否", "不", "不要", "跳过", "取消"):
+                    await self._remove_pending_push(sid)
+                    yield event.plain_result("⏭️ 已跳过推送，请自行复制直链下载")
+                    return
+                # 其他消息：保持等待状态
+                yield event.plain_result(
+                    "⏳ 请回复 y 推送到下载器，或回复 n 跳过\n"
+                    + f"⏱️ {self._PUSH_TIMEOUT}秒内有效\n回复分享链接可取消确认"
                 )
                 return
 
@@ -443,9 +505,43 @@ class BaiduCurlPlugin(Star):
                 # 清理 /来自Bot 中的过期文件
                 await self._cleanup_old_files()
 
-                # 合并输出：直链 + 移动结果
-                yield ev.plain_result("\n\n".join(out) + move_msg)
-                return
+                # 合并输出：cURL 命令 + 移动结果
+                base_msg = "\n\n".join(out) + move_msg
+
+                # ---- 下载器推送（按模式分流）----
+                if self.push_mode == "link_only":
+                    yield ev.plain_result(base_msg)
+                    return
+                if self.push_mode == "push_only":
+                    if self._can_push(ev):
+                        push_msg = await self._push_downloaders(dlinks)
+                        yield ev.plain_result(base_msg + "\n\n" + push_msg)
+                    else:
+                        yield ev.plain_result(
+                            base_msg
+                            + "\n\n⚠️ 当前会话不在推送白名单中，已跳过推送\n"
+                            + "（管理员可在 推送白名单 push_whitelist 中添加本会话）"
+                        )
+                    return
+                if self.push_mode == "link_and_push":
+                    if self._can_push(ev):
+                        await self._set_pending_push(
+                            ev.session_id,
+                            {"dlinks": dlinks, "timestamp": time.time()},
+                        )
+                        yield ev.plain_result(
+                            base_msg
+                            + "\n\n🚀 是否推送到下载器（Motrix）？\n"
+                            + "回复 y 推送，回复 n 跳过\n"
+                            + f"⏱️ {self._PUSH_TIMEOUT}秒内有效"
+                        )
+                    else:
+                        yield ev.plain_result(
+                            base_msg
+                            + "\n\n⚠️ 当前会话不在推送白名单中，已跳过推送\n"
+                            + "（管理员可在 推送白名单 push_whitelist 中添加本会话）"
+                        )
+                    return
             else:
                 yield ev.plain_result("⚠️ 获取直链失败")
 
@@ -1515,4 +1611,85 @@ class BaiduCurlPlugin(Star):
         except Exception as e:
             logger.exception(f"[move] 移动失败: {e}")
             return False
+
+    # ==================== 下载器推送（Motrix / aria2 RPC） ====================
+
+    def _can_push(self, ev: AstrMessageEvent) -> bool:
+        """推送白名单检查：仅 push_whitelist 中的会话可触发推送"""
+        if not self.push_whitelist:
+            return False
+        return ev.session_id in self.push_whitelist
+
+    def _get_bduss(self) -> str:
+        """从 baidu_cookies 提取 BDUSS（推送下载器时需要，配合 UA 实现会员满速）"""
+        cookies = self._parse_cookie_string(self.baidu_cookies)
+        return cookies.get("BDUSS", "")
+
+    async def _do_push(self, ev: AstrMessageEvent, dlinks: list):
+        """推送确认后的执行入口"""
+        yield ev.plain_result("🚀 推送到下载器中...")
+        push_msg = await self._push_downloaders(dlinks)
+        yield ev.plain_result(push_msg)
+
+    async def _push_downloaders(self, dlinks: list) -> str:
+        """把直链推送到 Motrix（aria2 RPC），返回结果文本
+
+        推送时携带 User-Agent + BDUSS Cookie（会员不限速关键）
+        """
+        bduss = self._get_bduss()
+        if not bduss:
+            return (
+                "⚠️ 未找到 BDUSS Cookie，无法推送\n"
+                "（会员满速下载需要携带 UA + BDUSS Cookie，请检查 baidu_cookies 配置）"
+            )
+        if not self.motrix_rpc_url:
+            return (
+                "⚠️ 未配置 Motrix\n"
+                "请在设置中配置 motrix_rpc_url（如 http://127.0.0.1:16800/jsonrpc）"
+            )
+
+        results = []
+        for dl in dlinks:
+            name = dl["name"]
+            url = dl["dlink"]
+            ok, err = await self._push_motrix(name, url, bduss)
+            icon = "✅" if ok else "❌"
+            err_text = err or "已添加任务"
+            results.append(f"📄 {name}\n{icon} Motrix: {err_text}")
+
+        return "🚀 推送结果：\n\n" + "\n\n".join(results)
+
+    async def _push_motrix(self, filename: str, url: str, bduss: str) -> tuple:
+        """推送到 Motrix（aria2 JSON-RPC），带 UA + BDUSS Cookie"""
+        headers = [
+            f"User-Agent: {self._PUSH_UA}",
+            f"Cookie: BDUSS={bduss}",
+        ]
+        options = {"out": filename, "header": headers}
+        if self.motrix_download_dir:
+            options["dir"] = self.motrix_download_dir
+        params = [[url], options]
+        if self.motrix_rpc_token:
+            params.insert(0, f"token:{self.motrix_rpc_token}")
+        payload = {
+            "id": str(int(time.time() * 1000)),
+            "jsonrpc": "2.0",
+            "method": "aria2.addUri",
+            "params": params,
+        }
+        try:
+            async with aiohttp.ClientSession() as sess:
+                async with sess.post(
+                    self.motrix_rpc_url,
+                    json=payload,
+                    timeout=15,
+                ) as resp:
+                    data = await resp.json(content_type=None)
+            if data.get("result"):
+                return True, ""
+            err = data.get("error", {})
+            msg = err.get("message", "") if isinstance(err, dict) else str(err)
+            return False, f"RPC 错误: {msg or data}"
+        except Exception as e:
+            return False, f"连接失败: {e}"
 

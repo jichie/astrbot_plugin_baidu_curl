@@ -21,6 +21,9 @@
 - 🔍 **智能扫描** - 自动发现 sharelink 和日期目录
 - 🗑️ **过期清理** - 可配置自动删除 `/来自Bot` 中超过保留时长的文件
 - 📂 **多文件选择** - 转存后如有多个文件，可让用户选择要提取直链的文件
+- 🚀 **推送下载器** - 提取直链后推送到 Motrix（aria2 RPC），自动携带 UA + BDUSS Cookie 实现会员不限速下载（参考[网盘直链下载助手](https://greasyfork.org/zh-CN/scripts/512125)油猴脚本）
+- 🔀 **三种模式** - 只提取直链 / 直接推送 / 显示直链后询问是否推送
+- 🔒 **推送白名单** - 推送功能独立白名单，与提取直链权限分离
 
 ## 📋 前置依赖
 
@@ -53,6 +56,11 @@
 | `allow_sessions` | 允许的会话列表 | 留空则所有会话可用 |
 | `file_retention_hours` | 文件保留时长（小时） | `24`（0 = 禁用自动清理） |
 | `enable_file_selection` | 多文件时允许用户选择 | `true`（关闭则全部提取直链） |
+| `push_mode` | 推送模式 | `link_only` / `push_only` / `link_and_push` |
+| `push_whitelist` | 推送白名单（与 allow_sessions 独立） | 留空则禁止推送 |
+| `motrix_rpc_url` | Motrix RPC 地址 | `http://127.0.0.1:16800/jsonrpc` |
+| `motrix_rpc_token` | Motrix RPC 密钥 | 无则留空 |
+| `motrix_download_dir` | Motrix 下载保存目录 | 留空用默认 |
 
 ## 🚀 使用方法
 
@@ -100,6 +108,25 @@ https://pan.baidu.com/s/1xxxxxxx 提取码:xxxx
 - 回复 `0`、`all`、`全部` 或 `所有` 选择全部文件
 - 120 秒内未选择自动取消，重新发送链接即可
 - 发送新的分享链接会自动取消上次选择
+
+### 🚀 推送到下载器（Motrix）
+
+`push_mode` 三种模式：
+
+| 模式 | 行为 |
+|------|------|
+| `link_only` | 只提取直链（原行为） |
+| `push_only` | 提取直链后自动推送到下载器，无需确认 |
+| `link_and_push` | 显示直链后再询问是否推送（回复 `y` 推送 / `n` 跳过，60 秒内有效） |
+
+**推送白名单**：`push_whitelist` 与 `allow_sessions` 相互独立。留空则所有会话均禁止推送（提取直链不受影响）；填写群号/用户 ID 后仅白名单内会话可触发推送。
+
+**Motrix**：
+1. 打开 Motrix → 设置 → RPC 服务 → 开启 RPC 服务（默认端口 16800）
+2. 配置 `motrix_rpc_url`：`http://127.0.0.1:16800/jsonrpc`
+3. 如设置了 RPC 密钥，填入 `motrix_rpc_token`
+
+**会员不限速说明**：推送时自动携带 `User-Agent: pan.baidu.com`（与插件生成的 cURL 命令一致，固定值）和 `BDUSS` Cookie。Motrix/aria2 会用这些请求头实际请求百度直链，效果与在终端粘贴 cURL 命令相同，会员账号可不限速下载。
 
 ## 📝 输出示例
 
@@ -165,6 +192,14 @@ A: 重新获取百度网盘 Cookie 更新到 `baidu_cookies` 配置项。
 A: v7.1+ 已通过 `server_mtime` 时间过滤解决，只匹配本次转存期间创建的文件。
 
 ## 📄 更新日志
+
+### v8.4 (2026-08-14)
+- 🚀 新增推送到下载器功能（Motrix / aria2 RPC），参考"网盘直链下载助手"油猴脚本
+- 🔗 推送时自动携带 User-Agent（固定 `pan.baidu.com`，与 cURL 命令一致）和 BDUSS Cookie，下载器请求直链时与终端 cURL 效果一致，会员账号不限速下载
+- 🔀 新增 `push_mode` 三模式：`link_only` 只提取直链 / `push_only` 直接推送 / `link_and_push` 显示直链后询问是否推送（回复 y/n，60 秒超时）
+- 🔒 新增 `push_whitelist` 推送独立白名单，与 `allow_sessions` 分离
+- 🖥️ 通过 aria2 JSON-RPC（`aria2.addUri`）推送，支持 RPC 密钥与保存目录
+- 📄 直链输出优化：始终显示直链 URL，cURL 命令由 `show_curl_command` 控制
 
 ### v8.3 (2026-06-30)
 - 🛠️ 重构 `_scan_files_sync`：提取通用递归扫描函数，嵌套从 7 层降至 3 层

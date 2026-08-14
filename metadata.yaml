@@ -1,6 +1,6 @@
 name: astrbot_plugin_baidu_curl
-display_name: 百度网盘cURL下载助手
-desc: 发送百度网盘分享链接，自动转存、提取直链并生成cURL下载命令。内置转存（BDUSS Cookie）、OpenList集成、文件自动整理、多文件选择。
+display_name: 百度网盘直链下载助手
+desc: 发送百度网盘分享链接，自动转存、提取直链并生成cURL下载命令。支持推送到 Motrix 下载器（携带 UA + BDUSS Cookie 实现会员不限速）。内置转存（BDUSS Cookie）、OpenList集成、文件自动整理、多文件选择。
 help: |
   使用方法：
   1. 配置百度网盘 Cookie（baidu_cookies）
@@ -18,10 +18,21 @@ help: |
   - 回复 0 或 all 选择全部
   - 120秒内有效，发送新链接可取消选择
 
+  推送到下载器（Motrix）：
+  - push_mode 三种模式：
+    · link_only：只提取直链（原行为）
+    · push_only：提取直链后自动推送到下载器
+    · link_and_push：显示直链后再询问是否推送（回复 y 推送 / n 跳过，60秒内有效）
+  - push_whitelist：推送白名单（群号/用户ID），与 allow_sessions 独立，留空禁止推送
+  - Motrix：配置 motrix_rpc_url（如 http://127.0.0.1:16800/jsonrpc）及可选 motrix_rpc_token，
+    并在 Motrix 设置中开启 RPC 服务
+  - 推送时自动携带 User-Agent（pan.baidu.com，与已验证不限速的 cURL 命令一致）
+    和 BDUSS Cookie，下载器请求直链时同样不限速，效果等同终端 cURL 下载
+
   前置依赖：
   - 百度网盘 Cookie（BDUSS + STOKEN）
   - OpenList/AList：用于获取百度网盘 access_token
-version: v8.3.1
+version: v8.4.0
 author: jichie
 repo: https://github.com/jichie/astrbot_plugin_baidu_curl
 license: MIT
@@ -30,3 +41,5 @@ tags:
   - 下载
   - 转存
   - cURL
+  - Motrix
+  - 推送

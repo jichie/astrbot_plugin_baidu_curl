@@ -26,3 +26,6 @@ Thumbs.db
 config/
 *.json
 !_conf_schema.json
+
+# Runtime data
+/data/
