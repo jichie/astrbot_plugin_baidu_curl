@@ -53,7 +53,7 @@
 | `openlist_pass` | OpenList 密码 | - |
 | `openlist_pan_path` | OpenList 百度网盘挂载路径 | `/百度` |
 | `show_curl_command` | 显示 cURL 命令 | `true` |
-| `allow_sessions` | 允许的会话列表 | 留空则所有会话可用 |
+| `allow_sessions` | 允许的会话列表 | 留空则所有会话禁用 |
 | `file_retention_hours` | 文件保留时长（小时） | `24`（0 = 禁用自动清理） |
 | `enable_file_selection` | 多文件时允许用户选择 | `true`（关闭则全部提取直链） |
 | `push_mode` | 推送模式 | `link_only` / `push_only` / `link_and_push` |
