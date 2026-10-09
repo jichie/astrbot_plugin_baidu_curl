@@ -79,7 +79,7 @@
     },
     "motrix_rpc_token": {
         "description": "Motrix RPC 密钥",
-        "hint": "Motrix 设置 → RPC 服务 → RPC 密钥，没有则留空",
+        "hint": "⚠️ 强烈建议设置：RPC 地址非本机且无密钥时，推送携带的 BDUSS Cookie 将明文经过网络。Motrix 设置 → RPC 服务 → RPC 密钥",
         "type": "string",
         "default": ""
     },

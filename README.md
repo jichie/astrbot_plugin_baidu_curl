@@ -59,7 +59,7 @@
 | `push_mode` | 推送模式 | `link_only` / `push_only` / `link_and_push` |
 | `push_whitelist` | 推送白名单（与 allow_sessions 独立） | 留空则禁止推送 |
 | `motrix_rpc_url` | Motrix RPC 地址 | `http://127.0.0.1:16800/jsonrpc` |
-| `motrix_rpc_token` | Motrix RPC 密钥 | 无则留空 |
+| `motrix_rpc_token` | Motrix RPC 密钥 | 无则留空（非本机 RPC 强烈建议设置，否则 BDUSS 明文过网） |
 | `motrix_download_dir` | Motrix 下载保存目录 | 留空用默认 |
 
 ## 🚀 使用方法
@@ -156,6 +156,7 @@ curl -L -o "文件名.mp4" \
 - `-L`：跟随重定向
 - `-o`：指定输出文件名
 - `-H "User-Agent:pan.baidu.com"`：大文件（>20MB）必须用此 User-Agent
+- ⚠️ 命令中包含完整 `access_token`（有效期约 30 天，可用于访问整个网盘）。建议仅在私聊或可信会话中显示，群聊场景推荐改用 `push_only` 模式，直链只进下载器不出现在聊天记录
 
 ## 🔧 工作原理
 
@@ -167,12 +168,13 @@ curl -L -o "文件名.mp4" \
 
 ## ⚠️ 注意事项
 
-- access_token 有效期约 8 小时，插件会自动刷新
-- 百度直链有效期约 8 小时
+- access_token 有效期约 30 天（非 8 小时；8 小时是直链本身的有效期），插件会从 OpenList 自动加载
+- 直链有效期约 8 小时
 - BDUSS/STOKEN Cookie 可能过期，需定期更新
 - OpenList 需要挂载百度网盘
 - 文件会自动整理到 `save_dir` 目录下
 - 过期文件清理需设置 `file_retention_hours > 0`
+- 直链 URL 含 access_token：群聊显示完整命令会让所有成员拿到可操作整个网盘的凭证，群聊场景建议 `push_only` 模式
 
 ## 🐛 常见问题
 
@@ -192,6 +194,18 @@ A: 重新获取百度网盘 Cookie 更新到 `baidu_cookies` 配置项。
 A: v7.1+ 已通过 `server_mtime` 时间过滤解决，只匹配本次转存期间创建的文件。
 
 ## 📄 更新日志
+
+### v8.5 (2026-10-03)
+- 🐛 修复 `share_info` 透传未生效：转存不再重复执行密码验证 + 页面解析 + 递归列目录（减少风控暴露）
+- 🐛 修复关闭 `show_curl_command` 后直链完全不输出的问题（现在输出不带命令的裸直链）
+- 🐛 修复提取码兜底正则过松：消息结尾的年份等 4 字符不再被误当提取码
+- 🐛 修复过期清理计数不实：只统计百度确认删除成功的数量
+- 🔒 等待文件选择 / 推送确认时不再劫持会话内其他消息（静默放行，其他插件正常响应）
+- 🔒 推送文件名消毒：路径分隔符等危险字符替换为 `_`，防止 aria2 越界写入
+- 🔒 Motrix RPC 非本机且无密钥时警告 BDUSS 明文过网
+- ⚡ 直链搜索目录收窄为文件实际父目录；分享目录递归增加 5 层深度上限
+- 🧹 7 处 cffi Session 改为 with 自动关闭；移除 `_scan_files_sync` 死参数
+- ⚠️ `curl_cffi` 下限修正为 `>=0.7.0`（`chrome120` 模拟在 0.5.x 不存在，按下限安装会全部请求失败）
 
 ### v8.4 (2026-08-14)
 - 🚀 新增推送到下载器功能（Motrix / aria2 RPC），参考"网盘直链下载助手"油猴脚本
