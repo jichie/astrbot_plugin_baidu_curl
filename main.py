@@ -1,5 +1,5 @@
 """
-百度网盘 cURL 下载助手 v8.5.4
+百度网盘 cURL 下载助手 v8.5.5
 内置转存（BDUSS Cookie）+ refresh_token 刷新 + filemetas API 获取直链
 支持多文件时用户选择要提取直链的文件
 """
@@ -159,29 +159,26 @@ class BaiduCurlPlugin(Star):
         # ---- 检查是否有待推送确认（link_and_push 模式）----
         pstate = await self._get_pending_push(sid)
         if pstate:
-            # 超时检查
+            # 超时：静默清理（不发提示），后续新链接正常处理
             if time.time() - pstate["timestamp"] > self._PUSH_TIMEOUT:
                 await self._remove_pending_push(sid)
-                yield event.plain_result("⏰ 推送确认已超时，可重新发送链接")
-                return
-
-            # 如果是新的分享链接，取消上次推送确认，继续处理新链接
-            if self._RE.search(text):
+            # 只认 y/n；新分享链接取消上次确认继续处理；其他消息静默放行
+            elif self._RE.search(text):
                 await self._remove_pending_push(sid)
                 yield event.plain_result("ℹ️ 已取消上次的推送确认，开始处理新链接...")
                 # 继续往下处理新链接（不 return）
             else:
                 ans = text.strip().lower()
-                if ans in ("y", "yes", "是", "要", "好的", "ok", "推送", "推"):
+                if ans == "y":
                     await self._remove_pending_push(sid)
                     async for msg in self._do_push(event, pstate["dlinks"]):
                         yield msg
                     return
-                if ans in ("n", "no", "否", "不", "不要", "跳过", "取消"):
+                if ans == "n":
                     await self._remove_pending_push(sid)
                     yield event.plain_result("⏭️ 已跳过推送，请自行复制直链下载")
                     return
-                # 其他消息：静默放行（不劫持会话，其他插件可正常处理），等待状态保持
+                # 其他消息：静默放行（不劫持会话，其他插件可正常处理）
                 return
 
         # 如果是影视转存命令，跳过（由 media_save 插件处理）
@@ -639,8 +636,7 @@ class BaiduCurlPlugin(Star):
                         yield ev.plain_result(
                             base_msg
                             + "\n\n🚀 是否推送到下载器（Motrix）？\n"
-                            + "回复 y 推送，回复 n 跳过\n"
-                            + f"⏱️ {self._PUSH_TIMEOUT}秒内有效"
+                            + "回复 y 推送，回复 n 跳过（仅认 y/n，60秒内有效，超时静默作废）"
                         )
                     else:
                         yield ev.plain_result(
