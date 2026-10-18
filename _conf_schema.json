@@ -17,6 +17,12 @@
         "type": "bool",
         "default": true
     },
+    "folder_browse_threshold": {
+        "description": "目录浏览模式阈值（0=关闭）",
+        "hint": "分享文件数超过该值时进入按文件夹浏览选择（可逐级进入文件夹、返回上级、多选后确认转存）；不超过则用平铺数字选择。默认 0=关闭（始终平铺选择）；设为 10 表示超过 10 个文件才进入浏览模式，最小生效值 2",
+        "type": "int",
+        "default": 0
+    },
     "show_curl_command": {
         "description": "显示cURL命令",
         "hint": "是否显示完整的cURL下载命令",

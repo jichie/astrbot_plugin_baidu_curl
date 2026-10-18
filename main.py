@@ -1,5 +1,5 @@
 """
-百度网盘 cURL 下载助手 v8.5.5
+百度网盘 cURL 下载助手 v8.6.0
 内置转存（BDUSS Cookie）+ refresh_token 刷新 + filemetas API 获取直链
 支持多文件时用户选择要提取直链的文件
 """
@@ -70,6 +70,14 @@ class BaiduCurlPlugin(Star):
         self.file_retention_hours: int = int(cfg.get("file_retention_hours", 0) or 0)
         # 多文件选择
         self.enable_file_selection: bool = cfg.get("enable_file_selection", True)
+        # 展平选择→目录浏览的切换阈值：分享文件数超过该值时按文件夹浏览选择
+        # 0 = 关闭目录浏览（任何文件数都用平铺选择）
+        try:
+            self.folder_browse_threshold: int = int(cfg.get("folder_browse_threshold", 0) or 0)
+        except (TypeError, ValueError):
+            self.folder_browse_threshold = 0
+        if self.folder_browse_threshold < 0:
+            self.folder_browse_threshold = 0
         # 百度网盘 Cookie
         self.baidu_cookies: str = cfg.get("baidu_cookies", "")
         # ---- 下载器推送 ----
@@ -134,27 +142,34 @@ class BaiduCurlPlugin(Star):
         # ---- 检查是否有待处理的文件选择 ----
         state = await self._get_pending_state(sid)
         if state:
-            # 超时检查
+            # 超时：静默清理（不发提示）；本条消息按无选择状态继续判断
             if time.time() - state["timestamp"] > self._SELECTION_TIMEOUT:
                 await self._remove_pending_state(sid)
-                yield event.plain_result("⏰ 文件选择已超时，请重新发送链接")
-                return
-
-            selection_text = text.strip()
-            # 如果是选择消息（数字/范围 1-4/一到四/all/全部 等），交给选择处理
-            if self._looks_like_selection(selection_text):
-                async for msg in self._handle_selection(event, selection_text):
-                    yield msg
-                return
-
-            # 如果是新的分享链接，取消上次选择，继续处理新链接
-            if self._RE.search(text):
-                await self._remove_pending_state(sid)
-                yield event.plain_result("ℹ️ 已取消上次的文件选择，开始处理新链接...")
-                # 继续往下处理新链接（不 return）
+                state = None
             else:
-                # 非选择消息：静默放行（不劫持会话，其他插件可正常处理），等待状态保持
-                return
+                selection_text = text.strip()
+                # 目录浏览模式：处理导航/选择/确认
+                if state.get("mode") == "browse":
+                    async for msg in self._handle_browse(event, selection_text, state):
+                        if msg is not None:
+                            yield msg
+                    # browse 未处理的消息（普通聊天）静默放行
+                    return
+
+                # 如果是选择消息（数字/范围 1-4/一到四/all/全部 等），交给选择处理
+                if self._looks_like_selection(selection_text):
+                    async for msg in self._handle_selection(event, selection_text):
+                        yield msg
+                    return
+
+                # 如果是新的分享链接，取消上次选择，继续处理新链接
+                if self._RE.search(text):
+                    await self._remove_pending_state(sid)
+                    yield event.plain_result("ℹ️ 已取消上次的文件选择，开始处理新链接...")
+                    # 继续往下处理新链接（不 return）
+                else:
+                    # 非选择消息：静默放行（不劫持会话，其他插件可正常处理），等待状态保持
+                    return
 
         # ---- 检查是否有待推送确认（link_and_push 模式）----
         pstate = await self._get_pending_push(sid)
@@ -224,20 +239,12 @@ class BaiduCurlPlugin(Star):
             yield ev.plain_result("❌ " + lr.get("error", "未知"))
             return
 
-        share_files = lr["files"]  # [{name, fs_id, path}]
+        share_files = lr["files"]  # [{name, fs_id, path}]（展平）
+        tree = lr.get("tree") or share_files  # 顶层结构（文件夹不展平），旧缓存无 tree 时退化为展平
 
         # 2. 多文件选择
         if self.enable_file_selection and len(share_files) > 1:
-            lines = []
-            for i, f in enumerate(share_files, 1):
-                size_str = self._format_size(f.get("size", 0))
-                if size_str:
-                    lines.append(f"{i}. {f['name']}（{size_str}）")
-                else:
-                    lines.append(f"{i}. {f['name']}")
-
-            await self._set_pending_state(ev.session_id, {
-                "share_files": share_files,
+            base_state = {
                 "surl": surl,
                 "pwd": pwd,
                 "uk": lr.get("uk"),
@@ -245,17 +252,45 @@ class BaiduCurlPlugin(Star):
                 "bdstoken": lr.get("bdstoken", ""),
                 "share_url": lr.get("share_url", ""),
                 "timestamp": time.time(),
-            })
+            }
 
-            yield ev.plain_result(
-                f"📂 共 {len(share_files)} 个文件，请选择要转存并提取直链的文件：\n\n"
-                + "\n".join(lines)
-                + "\n\n💡 回复数字选择（多个用空格/逗号分隔，如 1 3）\n"
-                + "💡 支持范围：1-4、7-9（中间隔着的也行），也可写 1到4、一到四\n"
-                + "💡 回复 0 或 all 选择全部\n"
-                + f"⏱️ {self._SELECTION_TIMEOUT}秒内有效"
-            )
-            return  # 等待用户选择
+            # 阈值 0 = 关闭目录浏览，任何文件数都走平铺选择
+            if self.folder_browse_threshold <= 0 or len(share_files) <= self.folder_browse_threshold:
+                # 少量文件：维持旧的平铺选择策略
+                lines = []
+                for i, f in enumerate(share_files, 1):
+                    size_str = self._format_size(f.get("size", 0))
+                    if size_str:
+                        lines.append(f"{i}. {f['name']}（{size_str}）")
+                    else:
+                        lines.append(f"{i}. {f['name']}")
+
+                await self._set_pending_state(ev.session_id, {
+                    **base_state,
+                    "share_files": share_files,
+                })
+
+                yield ev.plain_result(
+                    f"📂 共 {len(share_files)} 个文件，请选择要转存并提取直链的文件：\n\n"
+                    + "\n".join(lines)
+                    + "\n\n💡 回复数字选择（多个用空格/逗号分隔，如 1 3）\n"
+                    + "💡 支持范围：1-4、7-9（中间隔着的也行），也可写 1到4、一到四\n"
+                    + "💡 回复 0 或 all 选择全部\n"
+                    + f"⏱️ {self._SELECTION_TIMEOUT}秒内有效"
+                )
+                return  # 等待用户选择
+
+            # 大量文件：目录浏览模式（文件夹不展平，逐级进入，返回上级）
+            await self._set_pending_state(ev.session_id, {
+                **base_state,
+                "mode": "browse",
+                "tree": tree,
+                "cwd": [],        # 当前所在层级路径（顶层文件夹 index 链）
+                "selected": [],   # 已选集合 [{name, fs_id, isdir, path}]
+                "share_files": share_files,  # 展平列表（all 快捷键用）
+            })
+            yield ev.plain_result(self._render_browse_view(tree, [], [], len(share_files)))
+            return  # 等待用户浏览
 
         # 单文件或未启用选择：直接转存全部
         selected_indices = list(range(len(share_files)))
@@ -374,6 +409,378 @@ class BaiduCurlPlugin(Star):
                 indices.append(n - 1)
         return sorted(set(indices)) if indices else None
 
+    # ---- 目录浏览模式（大分享按文件夹选择）----
+
+    def _browse_items_at(self, tree: list, cwd: list) -> list:
+        """按 cwd（顶层/子层文件夹 index 链）取当前层级的条目列表"""
+        items = tree
+        for idx in cwd:
+            if not items or idx < 0 or idx >= len(items):
+                return []
+            node = items[idx]
+            if not node.get("isdir"):
+                return []
+            items = node.get("files") or []
+        return items
+
+    def _browse_crumbs(self, tree: list, cwd: list) -> str:
+        """浏览路径面包屑：按 cwd 逐层取文件夹名，如 "根目录 / 文件夹A / 子B\""""
+        names = []
+        items = tree
+        for idx in cwd:
+            if not items or idx < 0 or idx >= len(items):
+                break
+            node = items[idx]
+            names.append(node.get("name", "?"))
+            items = node.get("files") or []
+        if not names:
+            return "根目录"
+        return "根目录 / " + " / ".join(names)
+
+    def _render_browse_view(self, tree: list, cwd: list, selected: list, total_files: int) -> str:
+        """渲染当前浏览层：条目列表（文件夹带文件数）+ 已选清单 + 操作提示"""
+        items = self._browse_items_at(tree, cwd)
+        lines = []
+        for i, it in enumerate(items, 1):
+            if it.get("isdir"):
+                cnt = it.get("file_count")
+                if cnt is None:
+                    cnt = len(it.get("files") or [])
+                lines.append(f"{i}. 📁 {it['name']}（{cnt} 个文件）")
+            else:
+                size_str = self._format_size(it.get("size", 0))
+                suffix = f"（{size_str}）" if size_str else ""
+                lines.append(f"{i}. 📄 {it['name']}{suffix}")
+
+        view = f"📂 {self._browse_crumbs(tree, cwd)}（分享共 {total_files} 个文件）\n\n"
+        view += "\n".join(lines) if lines else "（空目录）"
+        view += "\n\n💡 回复数字：选中/取消该项；数字加 / 或 d：进入文件夹（如 3/）\n"
+        view += "💡 1-4 7-9 范围混选；回复 0 或 all 选中本层全部；再发一次可取消\n"
+        if cwd:
+            view += "💡 回复 b 或 返回：上一级；回复 r 或 根目录：直接回根目录\n"
+        view += "💡 回复 取消 或 清空：清空全部已选项\n"
+        view += "💡 选好后回复 ok 或 完成：开始转存\n"
+        view += f"⏱️ {self._SELECTION_TIMEOUT}秒内有效"
+
+        if selected:
+            sel_lines = []
+            for s in selected:
+                tag = "📁" if s.get("isdir") else "📄"
+                sel_lines.append(f"  {tag} {s['name']}")
+            view += "\n\n✅ 已选 " + str(len(selected)) + " 项：\n" + "\n".join(sel_lines)
+        return view
+
+    def _selected_key(self, it: dict):
+        return (it.get("isdir", 0), it.get("name"))
+
+    async def _handle_browse(self, ev: AstrMessageEvent, text: str, state: dict):
+        """目录浏览模式的交互处理：导航/选择/确认；未识别的消息不产出（上层静默放行）"""
+        sid = ev.session_id
+        tree = state["tree"]
+        cwd = state.get("cwd", [])
+        selected = state.get("selected", [])
+        items = self._browse_items_at(tree, cwd)
+        t = text.strip().lower()
+
+        # 确认转存
+        if t in ("ok", "完成", "确认", "转存"):
+            if not selected:
+                yield ev.plain_result("❌ 还没有选中任何文件，请先回复数字选择")
+                return
+            await self._remove_pending_state(sid)
+            async for msg in self._do_transfer_selected_set(ev, state, selected):
+                yield msg
+            return
+
+        # 返回上一级
+        if t in ("b", "back", "返回", "上级"):
+            if not cwd:
+                yield ev.plain_result("ℹ️ 已经在根目录了")
+                return
+            state["cwd"] = cwd[:-1]
+            await self._set_pending_state(sid, state)
+            yield ev.plain_result(self._render_browse_view(tree, state["cwd"], selected, len(state["share_files"])))
+            return
+
+        # 直接回根目录（保留已选）
+        if t in ("r", "root", "根目录"):
+            if not cwd:
+                yield ev.plain_result("ℹ️ 已经在根目录了")
+                return
+            state["cwd"] = []
+            await self._set_pending_state(sid, state)
+            yield ev.plain_result(self._render_browse_view(tree, [], selected, len(state["share_files"])))
+            return
+
+        # 清空已选（浏览状态保留，重新选）
+        if t in ("取消", "cancel", "清空", "重选"):
+            if not selected:
+                yield ev.plain_result("ℹ️ 当前没有已选的文件")
+                return
+            state["selected"] = []
+            await self._set_pending_state(sid, state)
+            yield ev.plain_result("🧹 已清空全部已选项\n\n" +
+                                  self._render_browse_view(tree, cwd, [], len(state["share_files"])))
+            return
+
+        # 当前层全选/取消
+        if t in ("0", "all", "全部", "所有"):
+            if not items:
+                yield ev.plain_result("❌ 当前层没有可选的项")
+                return
+            sel_map = {self._selected_key(s): s for s in selected}
+            all_on = all(self._selected_key(it) in sel_map for it in items)
+            if all_on:
+                for it in items:
+                    sel_map.pop(self._selected_key(it), None)
+                state["selected"] = list(sel_map.values())
+            else:
+                for it in items:
+                    sel_map[self._selected_key(it)] = {"name": it["name"], "fs_id": it.get("fs_id"),
+                                                       "path": it.get("path", ""), "isdir": it.get("isdir", 0)}
+                state["selected"] = list(sel_map.values())
+            await self._set_pending_state(sid, state)
+            yield ev.plain_result(self._render_browse_view(tree, cwd, state["selected"], len(state["share_files"])))
+            return
+
+        # "1 到 4" 空格合并（复用选择解析的预处理）
+        t2 = re.sub(
+            r"([0-9]+|[零〇一二两三四五六七八九十百]+)\s*([-~～—至到])\s*([0-9]+|[零〇一二两三四五六七八九十百]+)",
+            r"\1\2\3",
+            t,
+        )
+
+        # 逐段处理：支持 选中 / 进入 / 混合（如 "1/ 2 3-5"）
+        entered = False
+        changed = False
+        for seg in re.split(r"[,，、\s]+", t2):
+            if not seg:
+                continue
+            # 进入文件夹：数字+/ 或 数字+d
+            m = re.match(r"^(\d+)(?:/|d)$", seg)
+            if m:
+                idx = int(m.group(1)) - 1
+                if 0 <= idx < len(items) and items[idx].get("isdir"):
+                    cwd.append(idx)
+                    entered = True
+                    continue
+                if 0 <= idx < len(items):
+                    yield ev.plain_result(f"❌ 第 {idx + 1} 项是文件，不能进入")
+                    return
+                continue
+            # 范围段
+            m = re.match(r"^([0-9]+|[零〇一二两三四五六七八九十百]+)[-~～—至到]([0-9]+|[零〇一二两三四五六七八九十百]+)$", seg)
+            if m:
+                a = self._cn_to_int(m.group(1))
+                b = self._cn_to_int(m.group(2))
+                if a is None or b is None:
+                    continue
+                if a > b:
+                    a, b = b, a
+                for i in range(a, b + 1):
+                    if 1 <= i <= len(items):
+                        it = items[i - 1]
+                        key = self._selected_key(it)
+                        sel_map = {self._selected_key(s): s for s in selected}
+                        if key in sel_map:
+                            sel_map.pop(key)
+                        else:
+                            sel_map[key] = {"name": it["name"], "fs_id": it.get("fs_id"),
+                                            "path": it.get("path", ""), "isdir": it.get("isdir", 0)}
+                        selected = list(sel_map.values())
+                        changed = True
+                continue
+            # 单个数字：选中/取消
+            n = self._cn_to_int(seg)
+            if n is not None and 1 <= n <= len(items):
+                it = items[n - 1]
+                key = self._selected_key(it)
+                sel_map = {self._selected_key(s): s for s in selected}
+                if key in sel_map:
+                    sel_map.pop(key)
+                else:
+                    sel_map[key] = {"name": it["name"], "fs_id": it.get("fs_id"),
+                                    "path": it.get("path", ""), "isdir": it.get("isdir", 0)}
+                selected = list(sel_map.values())
+                changed = True
+
+        if not entered and not changed:
+            return  # 不像浏览指令，交给上层静默放行
+
+        state["cwd"] = cwd
+        state["selected"] = selected
+        await self._set_pending_state(sid, state)
+        yield ev.plain_result(self._render_browse_view(tree, cwd, selected, len(state["share_files"])))
+
+    async def _do_transfer_selected_set(self, ev: AstrMessageEvent, state: dict, selected: list):
+        """转存浏览模式选中的集合（文件夹整体 + 散文件混合），然后展开提取直链"""
+        surl, pwd = state["surl"], state["pwd"]
+        tree = state["tree"]
+        # 选中集合在浏览时可能来自任意层级；share_info.files 统一用"当前选中来源层"不可行，
+        # 所以把 tree 拍平成带完整相对路径的条目表（含文件夹本体与内部文件），按 (name,isdir) 唯一匹配
+        flat_tree = []
+
+        def _flatten(items, prefix=""):
+            for it in items:
+                entry = {"name": it["name"], "fs_id": it.get("fs_id"), "path": prefix + it["name"],
+                         "size": it.get("size", 0), "isdir": it.get("isdir", 0)}
+                flat_tree.append(entry)
+                if it.get("isdir"):
+                    _flatten(it.get("files") or [], prefix + it["name"] + "/")
+
+        _flatten(tree)
+        share_info = {
+            "files": flat_tree,
+            "uk": state.get("uk"),
+            "share_id": state.get("share_id"),
+            "bdstoken": state.get("bdstoken", ""),
+            "share_url": state.get("share_url", ""),
+        }
+
+        # 选中项 → flat_tree 索引（name+isdir 唯一匹配；重名时取第一个，分享同层不会重名）
+        indices = []
+        for s in selected:
+            idx = None
+            for i, it in enumerate(flat_tree):
+                if it["name"] == s["name"] and it.get("isdir", 0) == s.get("isdir", 0):
+                    idx = i
+                    break
+            if idx is None:
+                logger.warning(f"[browse] 选中项未匹配到分享列表: {s}")
+                continue
+            indices.append(idx)
+
+        if not indices:
+            yield ev.plain_result("❌ 选中项与分享列表不匹配，请重新发送链接")
+            return
+
+        # 转存（文件夹 fs_id 与文件 fs_id 混在一个 fsidlist，百度支持整体转存）
+        yield ev.plain_result("📦 转存中...")
+        tr = await self._transfer_selected_files(surl, pwd, indices, share_info)
+        if not tr.get("success"):
+            yield ev.plain_result("❌ 转存失败: " + tr.get("error", "未知"))
+            return
+
+        save_dir = tr.get("save_dir", self.save_dir)
+        transfer_files = tr.get("files", [])
+        existed = tr.get("existed", False)
+
+        # 文件夹整体转存时，转存返回的是文件夹名；用 tree 缓存展开为内部文件相对路径
+        folder_map = {}
+        def _collect_folders(items):
+            for it in items:
+                if it.get("isdir"):
+                    folder_map[it["name"]] = self._find_tree_folder_files(tree, it["name"]) or []
+                    _collect_folders(it.get("files") or [])
+        _collect_folders(tree)
+
+        expanded_names = []
+        for fn in transfer_files:
+            if fn in folder_map and folder_map[fn]:
+                expanded_names.extend(folder_map[fn])
+            else:
+                expanded_names.append(fn)
+        if expanded_names != transfer_files:
+            logger.info(f"[builtin] 文件夹展开: {transfer_files} -> {len(expanded_names)} 个文件")
+        transfer_files = expanded_names
+
+        yield ev.plain_result(
+            "✅ 转存成功！\n📁 " + save_dir + "\n📄 " + ", ".join(transfer_files[:20])
+            + ("…" if len(transfer_files) > 20 else "")
+        )
+
+        # 后续扫描+直链（与 _do_transfer_and_dlinks 相同）
+        async for msg in self._scan_and_dlinks(ev, surl, save_dir, transfer_files, existed):
+            yield msg
+
+    def _find_tree_folder_files(self, tree: list, folder_name: str, prefix: str = "") -> list:
+        """在 tree 里按文件夹名找其内部文件的相对路径（相对 save_dir，形如 "父/夹/文件.ext"），找不到返回 []"""
+        for it in tree:
+            if it.get("isdir"):
+                full = prefix + it["name"]
+                if it["name"] == folder_name:
+                    return [f"{full}/{f.get('name', '')}" for f in (it.get("files") or []) if not f.get("isdir")]
+                sub = self._find_tree_folder_files(it.get("files") or [], folder_name, full + "/")
+                if sub:
+                    return sub
+        return []
+
+    async def _scan_and_dlinks(self, ev: AstrMessageEvent, surl: str, save_dir: str,
+                               transfer_files: list, existed: bool):
+        """扫描匹配 + 提取直链（从 _do_transfer_and_dlinks 的步骤 2-4 提取复用）"""
+        await asyncio.sleep(3)
+        cutoff_time = 0 if existed else (int(time.time()) - 300)
+        if existed:
+            logger.info("[scan] 文件已存在，跳过时间过滤")
+        logger.info(f"[scan] 要匹配的文件: {transfer_files}, 已存在: {existed}")
+
+        files = []
+        was_cached = bool(self._access_token and self._token_expire and time.time() < self._token_expire)
+
+        token_ok = await self._refresh_access_token()
+        if token_ok and self._access_token:
+            scan_files = transfer_files if transfer_files else None
+            at = self._access_token
+            loop = asyncio.get_running_loop()
+            files, final_dir = await loop.run_in_executor(
+                None,
+                self._scan_files_sync,
+                at,
+                scan_files,
+                self.save_dir,
+                save_dir,
+                cutoff_time,
+            )
+            if final_dir:
+                save_dir = final_dir
+
+        if not files and was_cached and transfer_files:
+            logger.warning("[scan] 缓存 token 扫描结果为空，可能 token 已失效，重新获取...")
+            self._invalidate_token()
+            token_ok = await self._refresh_access_token()
+            if token_ok and self._access_token:
+                scan_files = transfer_files if transfer_files else None
+                at = self._access_token
+                loop = asyncio.get_running_loop()
+                files, final_dir = await loop.run_in_executor(
+                    None,
+                    self._scan_files_sync,
+                    at,
+                    scan_files,
+                    self.save_dir,
+                    save_dir,
+                    cutoff_time,
+                )
+                if final_dir:
+                    save_dir = final_dir
+
+        if not files:
+            files = [f"{save_dir}/{fn}" for fn in transfer_files]
+        elif transfer_files:
+            matched = set()
+            for p in files:
+                b = p.rsplit("/", 1)[-1]
+                matched.add(b)
+                matched.add(self._strip_dup_suffix(b))
+            missing = [fn for fn in transfer_files if fn not in matched]
+            if missing:
+                logger.info(f"[scan] 未匹配到 {missing}，按原始文件名兜底")
+                files = list(files) + [f"{save_dir}/{fn}" for fn in missing]
+            seen = set()
+            deduped = []
+            for p in files:
+                key = (p.rsplit("/", 1)[0] if "/" in p else "", self._strip_dup_suffix(p.rsplit("/", 1)[-1]))
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(p)
+            if len(deduped) != len(files):
+                logger.info(f"[scan] 同一文件多副本命中，去重 {len(files)} -> {len(deduped)}")
+            files = deduped
+
+        async for msg in self._run_dlinks(ev, files, save_dir, surl):
+            yield msg
+
     async def _handle_selection(self, ev: AstrMessageEvent, selection_text: str):
         """处理用户的多文件选择"""
         sid = ev.session_id
@@ -382,10 +789,9 @@ class BaiduCurlPlugin(Star):
             yield ev.plain_result("❌ 没有待选择的文件，请重新发送链接")
             return
 
-        # 超时检查
+        # 超时检查（正常流程在 on_message 已静默清理，这里兜底）
         if time.time() - state["timestamp"] > self._SELECTION_TIMEOUT:
             await self._remove_pending_state(sid)
-            yield ev.plain_result("⏰ 文件选择已超时，请重新发送链接")
             return
 
         share_files = state["share_files"]
@@ -447,87 +853,8 @@ class BaiduCurlPlugin(Star):
             "✅ 转存成功！\n📁 " + save_dir + "\n📄 " + ", ".join(transfer_files)
         )
 
-        # 2. 等待转存完成
-        await asyncio.sleep(3)
-
-        # 3. 用文件名在百度网盘里匹配（扫描确认）
-        cutoff_time = 0 if existed else (int(time.time()) - 300)
-        if existed:
-            logger.info("[scan] 文件已存在，跳过时间过滤")
-        logger.info(f"[scan] 要匹配的文件: {transfer_files}, 已存在: {existed}")
-
-        files = []
-        was_cached = bool(self._access_token and self._token_expire and time.time() < self._token_expire)
-
-        token_ok = await self._refresh_access_token()
-        if token_ok and self._access_token:
-            scan_files = transfer_files if transfer_files else None
-            at = self._access_token
-            loop = asyncio.get_running_loop()
-            files, final_dir = await loop.run_in_executor(
-                None,
-                self._scan_files_sync,
-                at,
-                scan_files,
-                self.save_dir,
-                save_dir,
-                cutoff_time,
-            )
-            if final_dir:
-                save_dir = final_dir
-
-        # 如果使用了缓存 token 但扫描结果为空，可能是 token 已失效，重试一次
-        if not files and was_cached and transfer_files:
-            logger.warning("[scan] 缓存 token 扫描结果为空，可能 token 已失效，重新获取...")
-            self._invalidate_token()
-            token_ok = await self._refresh_access_token()
-            if token_ok and self._access_token:
-                scan_files = transfer_files if transfer_files else None
-                at = self._access_token
-                loop = asyncio.get_running_loop()
-                files, final_dir = await loop.run_in_executor(
-                    None,
-                    self._scan_files_sync,
-                    at,
-                    scan_files,
-                    self.save_dir,
-                    save_dir,
-                    cutoff_time,
-                )
-                if final_dir:
-                    save_dir = final_dir
-
-        if not files:
-            # 扫描不到就用转存返回的文件名兜底
-            files = [f"{save_dir}/{fn}" for fn in transfer_files]
-        elif transfer_files:
-            # 扫描按文件名+时间匹配，个别文件可能因重名改名/时间过滤漏掉；
-            # 按原始文件名逐个补齐，保证每个选中文件都进入直链提取（直链阶段再按名匹配）
-            matched = set()
-            for p in files:
-                b = p.rsplit("/", 1)[-1]
-                matched.add(b)
-                matched.add(self._strip_dup_suffix(b))
-            missing = [fn for fn in transfer_files if fn not in matched]
-            if missing:
-                logger.info(f"[scan] 未匹配到 {missing}，按原始文件名兜底")
-                files = list(files) + [f"{save_dir}/{fn}" for fn in missing]
-            # existed 模式无时间过滤，旧原名与改名副本会同时命中；按逻辑文件名去重，
-            # 每个选中文件只保留一条直链（保留扫描阶段的取舍结果）
-            seen = set()
-            deduped = []
-            for p in files:
-                key = (p.rsplit("/", 1)[0] if "/" in p else "", self._strip_dup_suffix(p.rsplit("/", 1)[-1]))
-                if key in seen:
-                    continue
-                seen.add(key)
-                deduped.append(p)
-            if len(deduped) != len(files):
-                logger.info(f"[scan] 同一文件多副本命中，去重 {len(files)} -> {len(deduped)}")
-            files = deduped
-
-        # 4. 提取直链
-        async for msg in self._run_dlinks(ev, files, save_dir, surl):
+        # 2-4. 扫描 + 直链
+        async for msg in self._scan_and_dlinks(ev, surl, save_dir, transfer_files, existed):
             yield msg
 
     async def _run_dlinks(
@@ -1188,10 +1515,11 @@ class BaiduCurlPlugin(Star):
                 logger.info(f"[builtin] 分享根目录有 {len(root_files)} 项, uk={uk}, share_id={share_id}")
 
                 # ---- 步骤3: 递归收集所有文件信息（限制深度，防止超大分享触发风控）----
-                all_files = []  # [{name, fs_id, path}]
+                all_files = []  # [{name, fs_id, path}]（展平，兼容旧选择策略）
+                tree = []       # 顶层项（文件夹保留 isdir=1 + files 子项，供目录浏览模式）
                 max_depth = 5
 
-                def _collect_files(file_items, depth=0):
+                def _collect_files(file_items, depth=0, into=None):
                     if depth >= max_depth:
                         logger.warning(f"[builtin] 分享目录超过 {max_depth} 层，跳过: 当层 {len(file_items)} 项")
                         return
@@ -1202,14 +1530,34 @@ class BaiduCurlPlugin(Star):
                             sub_files = self._list_shared_dir_builtin(
                                 s, dir_path, uk, share_id
                             )
-                            _collect_files(sub_files, depth + 1)
+                            folder = {
+                                "name": f.get("server_filename") or dir_path.split("/")[-1],
+                                "fs_id": f.get("fs_id"),
+                                "path": dir_path,
+                                "size": f.get("size", 0),
+                                "isdir": 1,
+                            }
+                            # 记录文件夹内部文件（递归展平，供转存后展开直链）
+                            sub_flat = []
+                            _collect_files(sub_files, depth + 1, into=sub_flat)
+                            folder["files"] = sub_flat
+                            folder["file_count"] = len(sub_flat)
+                            if into is not None:
+                                into.append(folder)
+                            else:
+                                tree.append(folder)
                         else:
                             fs_id = f.get("fs_id")
                             if fs_id:
                                 name = f.get("server_filename") or f.get("path", "").split("/")[-1]
                                 path = f.get("path", name)
                                 size = f.get("size", 0)
-                                all_files.append({"name": name, "fs_id": fs_id, "path": path, "size": size})
+                                item = {"name": name, "fs_id": fs_id, "path": path, "size": size}
+                                all_files.append(item)
+                                if into is not None:
+                                    into.append(dict(item))
+                                else:
+                                    tree.append(dict(item))
                                 logger.info(f"[builtin] 记录文件: {name}")
 
                 _collect_files(root_files)
@@ -1222,6 +1570,7 @@ class BaiduCurlPlugin(Star):
                 return {
                     "success": True,
                     "files": all_files,
+                    "tree": tree,
                     "uk": uk,
                     "share_id": share_id,
                     "bdstoken": bdstoken,
