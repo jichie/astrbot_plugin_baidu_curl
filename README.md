@@ -48,7 +48,7 @@
 |--------|------|------|
 | `baidu_cookies` | 百度网盘 Cookie | 粘贴完整 Cookie 字符串 |
 | `save_dir` | 转存目标目录 | `/来自Bot` |
-| `openlist_url` | OpenList 地址 | `http://192.168.1.207:7344` |
+| `openlist_url` | OpenList 地址 | `http://192.168.1.100:5244` |
 | `openlist_user` | OpenList 用户名 | `admin` |
 | `openlist_pass` | OpenList 密码 | - |
 | `openlist_pan_path` | OpenList 百度网盘挂载路径 | `/百度` |

@@ -1,12 +1,17 @@
 """
-百度网盘 cURL 下载助手 v8.6.0
+百度网盘 cURL 下载助手 v8.6.1
 内置转存（BDUSS Cookie）+ refresh_token 刷新 + filemetas API 获取直链
 支持多文件时用户选择要提取直链的文件
+
+v8.6.1: 配置支持热更新（面板保存新 Cookie 立即生效，无需重载插件）；
+分享页解析兼容百度改版后的内联 JSON 数据形态。
 """
 
 from __future__ import annotations
 
 import asyncio
+import copy
+import os
 import time
 import json
 import re
@@ -46,6 +51,27 @@ def _parse(text: str) -> dict:
     return r
 
 
+# 需要支持热更新的配置项（面板保存/手动改配置文件后，下一次流程即生效）
+_LIVE_CONFIG_KEYS = (
+    "allow_sessions",
+    "save_dir",
+    "openlist_url",
+    "openlist_user",
+    "openlist_pass",
+    "openlist_pan_path",
+    "show_curl_command",
+    "file_retention_hours",
+    "enable_file_selection",
+    "folder_browse_threshold",
+    "baidu_cookies",
+    "push_mode",
+    "push_whitelist",
+    "motrix_rpc_url",
+    "motrix_rpc_token",
+    "motrix_download_dir",
+)
+
+
 class BaiduCurlPlugin(Star):
     _RE = re.compile(r"https?://pan\.baidu\.com/s/[a-zA-Z0-9_-]+")
     _SELECTION_TIMEOUT = 120  # 文件选择超时时间（秒）
@@ -73,11 +99,10 @@ class BaiduCurlPlugin(Star):
         # 展平选择→目录浏览的切换阈值：分享文件数超过该值时按文件夹浏览选择
         # 0 = 关闭目录浏览（任何文件数都用平铺选择）
         try:
-            self.folder_browse_threshold: int = int(cfg.get("folder_browse_threshold", 0) or 0)
+            _thr = int(cfg.get("folder_browse_threshold", 0) or 0)
         except (TypeError, ValueError):
-            self.folder_browse_threshold = 0
-        if self.folder_browse_threshold < 0:
-            self.folder_browse_threshold = 0
+            _thr = 0
+        self.folder_browse_threshold: int = max(0, _thr)
         # 百度网盘 Cookie
         self.baidu_cookies: str = cfg.get("baidu_cookies", "")
         # ---- 下载器推送 ----
@@ -89,6 +114,17 @@ class BaiduCurlPlugin(Star):
         self.motrix_rpc_url: str = cfg.get("motrix_rpc_url", "").strip()
         self.motrix_rpc_token: str = cfg.get("motrix_rpc_token", "")
         self.motrix_download_dir: str = cfg.get("motrix_download_dir", "")
+
+        # ---- 配置热更新（v8.6.1）----
+        # 上面 self.xxx 各属性只是初始化快照（兼容旧引用），运行时一律通过
+        # _cfg()/各 _get_xxx() 实时读取，保证面板保存新 Cookie 后下一条消息即生效。
+        # AstrBotConfig 是 dict 子类：保存配置时会原地 update 同一对象，持有原引用即可读到新值；
+        # 若配置对象被整体替换/用户直接编辑配置文件，则按 mtime 兜底重读磁盘配置文件。
+        self._config_ref = config if isinstance(config, dict) else {}
+        self._config_snapshot: dict = {k: copy.deepcopy(cfg.get(k)) for k in _LIVE_CONFIG_KEYS}
+        self._config_file_path = self._resolve_config_file_path(config)
+        self._disk_cfg_cache: dict | None = None
+        self._disk_cfg_sig = None
         # 缓存
         self._access_token: str = ""
         self._token_expire: float = 0  # token 过期时间戳
@@ -98,6 +134,161 @@ class BaiduCurlPlugin(Star):
         # 待推送确认的状态: session_id -> {dlinks, timestamp}
         self._pending_pushes: dict = {}
         self._push_lock = asyncio.Lock()
+
+    # ==================== 配置热更新（v8.6.1） ====================
+
+    @staticmethod
+    def _resolve_config_file_path(config) -> str | None:
+        """定位磁盘配置文件（用于配置对象不更新时的兜底重读）。找不到返回 None。"""
+        # 1) AstrBotConfig 自带 config_path（最可靠）
+        try:
+            p = getattr(config, "config_path", None)
+            if p:
+                return str(p)
+        except Exception:
+            pass
+        # 2) AstrBot 数据目录 + 固定文件名
+        try:
+            from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+
+            data_path = get_astrbot_data_path()
+            if data_path:
+                p = os.path.join(
+                    data_path, "config", "astrbot_plugin_baidu_curl_config.json"
+                )
+                if os.path.isfile(p):
+                    return p
+        except Exception:
+            pass
+        # 3) 从插件文件位置反推：<data>/plugins/<name>/main.py → <data>/config/<name>_config.json
+        try:
+            plugin_dir = os.path.dirname(os.path.abspath(__file__))
+            name = os.path.basename(plugin_dir)
+            p = os.path.join(
+                os.path.dirname(os.path.dirname(plugin_dir)),
+                "config",
+                f"{name}_config.json",
+            )
+            if os.path.isfile(p):
+                return p
+        except Exception:
+            pass
+        return None
+
+    def _read_disk_config(self) -> dict | None:
+        """按 mtime+size 缓存读取磁盘配置文件（utf-8-sig，兼容 BOM）。
+
+        任何异常都不抛出：读取失败时沿用上次缓存（可能为 None）。
+        """
+        path = getattr(self, "_config_file_path", None)
+        if not path:
+            return None
+        try:
+            st = os.stat(path)
+            sig = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return self._disk_cfg_cache
+        if self._disk_cfg_sig == sig and self._disk_cfg_cache is not None:
+            return self._disk_cfg_cache
+        try:
+            with open(path, "r", encoding="utf-8-sig") as f:
+                data = json.load(f)
+        except Exception:
+            return self._disk_cfg_cache
+        if isinstance(data, dict):
+            self._disk_cfg_cache = data
+            self._disk_cfg_sig = sig
+            return data
+        return self._disk_cfg_cache
+
+    def _cfg(self, key: str, default=None):
+        """实时读取配置项（修复：面板保存新 Cookie 后无需重载插件即生效）。
+
+        读取顺序：
+        1. 内存配置对象：AstrBot 保存配置时会原地更新同一个 AstrBotConfig 对象，
+           与快照不同即视为最新值（并滚动更新快照）；
+        2. 磁盘配置文件：按 mtime 兜底重读（兼容配置对象被整体替换、
+           或用户直接编辑配置文件的场景）；
+        3. 初始化快照 / default：都不可用时兜底，行为与旧版一致。
+
+        任何异常静默降级，绝不抛出；日志不打印任何配置值（含 Cookie）。
+        """
+        ref = getattr(self, "_config_ref", None)
+        if isinstance(ref, dict) and key in ref:
+            try:
+                cur = ref.get(key)
+                if cur != self._config_snapshot.get(key):
+                    self._config_snapshot[key] = copy.deepcopy(cur)
+                    return cur
+            except Exception:
+                pass
+        disk = self._read_disk_config()
+        if isinstance(disk, dict) and key in disk:
+            try:
+                return disk.get(key)
+            except Exception:
+                pass
+        snap = getattr(self, "_config_snapshot", None)
+        if isinstance(snap, dict) and key in snap:
+            return snap.get(key)
+        return default
+
+    def _get_allow_sessions(self) -> list:
+        v = self._cfg("allow_sessions", [])
+        return v if isinstance(v, list) else []
+
+    def _get_save_dir(self) -> str:
+        return self._cfg("save_dir", "/来自Bot")
+
+    def _get_openlist_url(self) -> str:
+        return (self._cfg("openlist_url", "") or "").rstrip("/")
+
+    def _get_openlist_user(self) -> str:
+        return self._cfg("openlist_user", "") or ""
+
+    def _get_openlist_pass(self) -> str:
+        return self._cfg("openlist_pass", "") or ""
+
+    def _get_openlist_pan_path(self) -> str:
+        return self._cfg("openlist_pan_path", "/百度")
+
+    def _get_show_curl_command(self):
+        return self._cfg("show_curl_command", True)
+
+    def _get_file_retention_hours(self) -> int:
+        try:
+            return int(self._cfg("file_retention_hours", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _get_enable_file_selection(self):
+        return self._cfg("enable_file_selection", True)
+
+    def _get_folder_browse_threshold(self) -> int:
+        try:
+            v = int(self._cfg("folder_browse_threshold", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+        return max(0, v)
+
+    def _get_push_mode(self) -> str:
+        return self._cfg("push_mode", "link_only")
+
+    def _get_push_whitelist(self) -> list:
+        v = self._cfg("push_whitelist", [])
+        return v if isinstance(v, list) else []
+
+    def _get_baidu_cookies(self) -> str:
+        return self._cfg("baidu_cookies", "") or ""
+
+    def _get_motrix_rpc_url(self) -> str:
+        return (self._cfg("motrix_rpc_url", "") or "").strip()
+
+    def _get_motrix_rpc_token(self) -> str:
+        return self._cfg("motrix_rpc_token", "") or ""
+
+    def _get_motrix_download_dir(self) -> str:
+        return self._cfg("motrix_download_dir", "") or ""
 
     async def terminate(self):
         pass
@@ -203,8 +394,9 @@ class BaiduCurlPlugin(Star):
             return
         if not self._RE.search(text):
             return
-        if self.allow_sessions:
-            if event.session_id not in self.allow_sessions:
+        allow_sessions = self._get_allow_sessions()
+        if allow_sessions:
+            if event.session_id not in allow_sessions:
                 return
         else:
             yield event.plain_result(
@@ -213,7 +405,7 @@ class BaiduCurlPlugin(Star):
                 "⚠️ 严禁在所有会话下开放此插件，否则可能导致百度凭据泄露！"
             )
             return
-        if not self.baidu_cookies:
+        if not self._get_baidu_cookies():
             yield event.plain_result(
                 "⚠️ 未配置百度网盘 Cookie\n"
                 "请在设置中填入 baidu_cookies（完整 Cookie 字符串）"
@@ -243,7 +435,7 @@ class BaiduCurlPlugin(Star):
         tree = lr.get("tree") or share_files  # 顶层结构（文件夹不展平），旧缓存无 tree 时退化为展平
 
         # 2. 多文件选择
-        if self.enable_file_selection and len(share_files) > 1:
+        if self._get_enable_file_selection() and len(share_files) > 1:
             base_state = {
                 "surl": surl,
                 "pwd": pwd,
@@ -255,7 +447,8 @@ class BaiduCurlPlugin(Star):
             }
 
             # 阈值 0 = 关闭目录浏览，任何文件数都走平铺选择
-            if self.folder_browse_threshold <= 0 or len(share_files) <= self.folder_browse_threshold:
+            folder_browse_threshold = self._get_folder_browse_threshold()
+            if folder_browse_threshold <= 0 or len(share_files) <= folder_browse_threshold:
                 # 少量文件：维持旧的平铺选择策略
                 lines = []
                 for i, f in enumerate(share_files, 1):
@@ -661,7 +854,7 @@ class BaiduCurlPlugin(Star):
             yield ev.plain_result("❌ 转存失败: " + tr.get("error", "未知"))
             return
 
-        save_dir = tr.get("save_dir", self.save_dir)
+        save_dir = tr.get("save_dir", self._get_save_dir())
         transfer_files = tr.get("files", [])
         existed = tr.get("existed", False)
 
@@ -727,7 +920,7 @@ class BaiduCurlPlugin(Star):
                 self._scan_files_sync,
                 at,
                 scan_files,
-                self.save_dir,
+                self._get_save_dir(),
                 save_dir,
                 cutoff_time,
             )
@@ -747,7 +940,7 @@ class BaiduCurlPlugin(Star):
                     self._scan_files_sync,
                     at,
                     scan_files,
-                    self.save_dir,
+                    self._get_save_dir(),
                     save_dir,
                     cutoff_time,
                 )
@@ -845,7 +1038,7 @@ class BaiduCurlPlugin(Star):
             yield ev.plain_result("❌ 转存失败: " + tr.get("error", "未知"))
             return
 
-        save_dir = tr.get("save_dir", self.save_dir)
+        save_dir = tr.get("save_dir", self._get_save_dir())
         transfer_files = tr.get("files", [])
         existed = tr.get("existed", False)
 
@@ -874,7 +1067,7 @@ class BaiduCurlPlugin(Star):
                 search_dirs.add("/" + "/".join(parts[:-1]))
         logger.info(f"[dlink] 搜索目录: {search_dirs}")
 
-        if self.openlist_url and self.openlist_user:
+        if self._get_openlist_url() and self._get_openlist_user():
             yield ev.plain_result("🔑 刷新百度 token...")
             was_cached = bool(self._access_token and self._token_expire and time.time() < self._token_expire)
             token_ok = await self._refresh_access_token()
@@ -896,7 +1089,7 @@ class BaiduCurlPlugin(Star):
 
             if dlinks:
                 out = []
-                if self.show_curl_command:
+                if self._get_show_curl_command():
                     out.append("🔧 cURL 命令:")
                     for dl in dlinks:
                         fn = dl["name"].replace('"', '\\"')
@@ -913,23 +1106,23 @@ class BaiduCurlPlugin(Star):
                         out.append("📄 " + dl["name"] + ": " + dl["dlink"])
                 # 移动文件夹到 /来自Bot
                 move_msg = ""
-                yield ev.plain_result("📁 移动文件夹到 " + self.save_dir + "...")
+                yield ev.plain_result("📁 移动文件夹到 " + self._get_save_dir() + "...")
                 # 先移动实际转存目录（如 /2024/202402/20240205）
                 if (
-                    save_dir != self.save_dir
+                    save_dir != self._get_save_dir()
                     and not save_dir.startswith("/来自Bot")
                     and "/sharelink" not in save_dir
                 ):
-                    move_ok = await self._move_single_dir(save_dir, self.save_dir)
+                    move_ok = await self._move_single_dir(save_dir, self._get_save_dir())
                     if move_ok:
                         move_msg += (
-                            "\n\n✅ " + save_dir + " 已移动到 " + self.save_dir
+                            "\n\n✅ " + save_dir + " 已移动到 " + self._get_save_dir()
                         )
 
                 # 再移动 sharelink 文件夹
-                move_ok = await self._move_folder("", self.save_dir)
+                move_ok = await self._move_folder("", self._get_save_dir())
                 if move_ok:
-                    move_msg += "\n\n✅ sharelink 文件夹已移动到 " + self.save_dir
+                    move_msg += "\n\n✅ sharelink 文件夹已移动到 " + self._get_save_dir()
                 elif not move_msg:
                     move_msg = "\n\n⚠️ 移动失败"
 
@@ -940,10 +1133,10 @@ class BaiduCurlPlugin(Star):
                 base_msg = "\n\n".join(out) + move_msg
 
                 # ---- 下载器推送（按模式分流）----
-                if self.push_mode == "link_only":
+                if self._get_push_mode() == "link_only":
                     yield ev.plain_result(base_msg)
                     return
-                if self.push_mode == "push_only":
+                if self._get_push_mode() == "push_only":
                     if self._can_push(ev):
                         push_msg = await self._push_downloaders(dlinks)
                         yield ev.plain_result(base_msg + "\n\n" + push_msg)
@@ -954,7 +1147,7 @@ class BaiduCurlPlugin(Star):
                             + "（管理员可在 推送白名单 push_whitelist 中添加本会话）"
                         )
                     return
-                if self.push_mode == "link_and_push":
+                if self._get_push_mode() == "link_and_push":
                     if self._can_push(ev):
                         await self._set_pending_push(
                             ev.session_id,
@@ -976,11 +1169,11 @@ class BaiduCurlPlugin(Star):
                 yield ev.plain_result("⚠️ 获取直链失败")
 
         # 即使没有获取直链，也尝试移动文件夹
-        yield ev.plain_result("📁 移动文件夹到 " + self.save_dir + "...")
-        move_ok = await self._move_folder("", self.save_dir)
+        yield ev.plain_result("📁 移动文件夹到 " + self._get_save_dir() + "...")
+        move_ok = await self._move_folder("", self._get_save_dir())
         if move_ok:
-            yield ev.plain_result("✅ 文件夹已移动到 " + self.save_dir)
-            save_dir = self.save_dir
+            yield ev.plain_result("✅ 文件夹已移动到 " + self._get_save_dir())
+            save_dir = self._get_save_dir()
 
         # 清理 /来自Bot 中的过期文件
         await self._cleanup_old_files()
@@ -1000,10 +1193,10 @@ class BaiduCurlPlugin(Star):
         try:
             async with aiohttp.ClientSession() as sess:
                 r = await sess.post(
-                    self.openlist_url + "/api/auth/login",
+                    self._get_openlist_url() + "/api/auth/login",
                     json={
-                        "username": self.openlist_user,
-                        "password": self.openlist_pass,
+                        "username": self._get_openlist_user(),
+                        "password": self._get_openlist_pass(),
                     },
                     allow_redirects=False,
                     timeout=10,
@@ -1011,7 +1204,7 @@ class BaiduCurlPlugin(Star):
                 admin_token = (await r.json()).get("data", {}).get("token", "")
 
                 r2 = await sess.get(
-                    self.openlist_url + "/api/admin/storage/list",
+                    self._get_openlist_url() + "/api/admin/storage/list",
                     headers={"Authorization": admin_token},
                     timeout=10,
                 )
@@ -1280,7 +1473,7 @@ class BaiduCurlPlugin(Star):
 
     async def _cleanup_old_files(self):
         """清理 /来自Bot 中超过保留时长的文件"""
-        if not self.file_retention_hours or not self._access_token:
+        if not self._get_file_retention_hours() or not self._access_token:
             return
         try:
             loop = asyncio.get_running_loop()
@@ -1294,7 +1487,7 @@ class BaiduCurlPlugin(Star):
 
     def _cleanup_old_files_sync(self, at: str) -> int:
         """同步清理过期文件（在线程池中执行）"""
-        cutoff = int(time.time()) - self.file_retention_hours * 3600
+        cutoff = int(time.time()) - self._get_file_retention_hours() * 3600
         all_files = []
 
         try:
@@ -1320,7 +1513,7 @@ class BaiduCurlPlugin(Star):
                     except Exception as e:
                         logger.warning(f"[cleanup] 列出目录失败: {e}", exc_info=True)
 
-                _list_recursive(self.save_dir)
+                _list_recursive(self._get_save_dir())
 
                 if not all_files:
                     return 0
@@ -1400,6 +1593,155 @@ class BaiduCurlPlugin(Star):
                 cookies[key.strip()] = value.strip()
         return cookies
 
+    # ---- 分享页数据提取（v8.6.1 起兼容多种页面形态）----
+
+    @staticmethod
+    def _extract_braced_json(html: str, start: int) -> str | None:
+        """从 html[start:] 提取第一个配平的 {...} 文本。
+
+        健壮的 JSON 提取：记录字符串状态，避免字符串中的花括号干扰。
+        找不到配平的花括号时返回 None。
+        """
+        brace_count = 0
+        in_string = False
+        escaped = False
+        end = start
+        for i, c in enumerate(html[start:], start):
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif c == '\\':
+                    escaped = True
+                elif c == '"':
+                    in_string = False
+            elif c == '"':
+                in_string = True
+            elif c == '{':
+                brace_count += 1
+            elif c == '}':
+                brace_count -= 1
+                if brace_count == 0:
+                    end = i + 1
+                    return html[start:end]
+        return None
+
+    @staticmethod
+    def _find_enclosing_object_start(html: str, pos: int) -> int | None:
+        """从 pos 反向扫描，找到包住该位置的最近一层 '{'（字符串感知），返回其下标。"""
+        depth = 0
+        in_string = False
+        i = pos - 1
+        while i >= 0:
+            c = html[i]
+            if c == '"':
+                # 统计前面连续反斜杠数量：奇数说明是转义引号，不算字符串边界
+                bs = 0
+                j = i - 1
+                while j >= 0 and html[j] == '\\':
+                    bs += 1
+                    j -= 1
+                if bs % 2 == 0:
+                    in_string = not in_string
+            elif not in_string:
+                if c == '}':
+                    depth += 1
+                elif c == '{':
+                    if depth == 0:
+                        return i
+                    depth -= 1
+            i -= 1
+        return None
+
+    @classmethod
+    def _extract_share_data(cls, html: str) -> tuple[dict | None, str | None]:
+        """从分享页 HTML 提取分享数据（share_uk/shareid/bdstoken/file_list）。
+
+        兼容三种页面形态：
+        1. 旧版: yunData.setData({...}) / locals.mset({...})
+        2. 改版（2026-11 线上实测）: 分享数据以内联 JSON 嵌在 <script> 里，
+           window.yunData = {...} 仅引用字段（share_uk: data.share_uk）不承载数据，
+           旧正则两个锚点都不存在 → 以 "shareid"/"file_list" 为锚点反查所属 JSON 对象。
+
+        Returns:
+            (data_dict, None)              成功
+            (None, "bad_json")             找到旧锚点但内容不是合法 JSON
+            (None, "no_anchor")            页面里找不到任何已知数据锚点
+        """
+        m = re.search(r"(?:yunData\.setData|locals\.mset)\(", html)
+        if m:
+            blob = cls._extract_braced_json(html, m.end())
+            if blob:
+                try:
+                    data = json.loads(blob)
+                    if isinstance(data, dict):
+                        return data, None
+                except json.JSONDecodeError:
+                    pass
+            return None, "bad_json"
+
+        # 改版页面：带引号锚点只会命中内联 JSON（window.yunData 里是未加引号的字段引用）
+        for anchor in ('"shareid"', '"file_list"'):
+            pos = html.find(anchor)
+            while pos != -1:
+                start = cls._find_enclosing_object_start(html, pos)
+                if start is not None:
+                    blob = cls._extract_braced_json(html, start)
+                    if blob:
+                        try:
+                            data = json.loads(blob)
+                            if isinstance(data, dict) and (
+                                "shareid" in data
+                                or "share_uk" in data
+                                or "file_list" in data
+                            ):
+                                return data, None
+                        except json.JSONDecodeError:
+                            pass
+                # 该处锚点解析失败，尝试下一处出现位置
+                pos = html.find(anchor, pos + len(anchor))
+        return None, "no_anchor"
+
+    @staticmethod
+    def _looks_like_login_page(html: str) -> bool:
+        """判断页面是否像登录/验证页（Cookie 失效的典型特征）"""
+        markers = (
+            "passport.baidu.com",
+            "/user/login",
+            "请登录",
+            "登录百度帐号",
+            "百度帐号登录",
+            "百度账号登录",
+        )
+        return any(mk in html for mk in markers)
+
+    @staticmethod
+    def _log_share_page_diagnosis(resp, html: str) -> None:
+        """解析失败时记录页面特征，便于区分 Cookie 失效 / 分享失效 / 百度再改版。
+
+        只记录结构与状态信息，绝不打印 Cookie 等凭据内容。
+        """
+        try:
+            title = ""
+            m = re.search(r"<title>(.*?)</title>", html or "", re.S)
+            if m:
+                title = m.group(1).strip()[:60]
+            logger.warning(
+                "[builtin] 无法从分享页提取数据: http=%s html_len=%s title=%r "
+                "yunData.setData=%s locals.mset=%s window.yunData=%s "
+                "shareid_anchor=%s file_list_anchor=%s login_like=%s",
+                getattr(resp, "status_code", "?"),
+                len(html or ""),
+                title,
+                "yunData.setData(" in (html or ""),
+                "locals.mset(" in (html or ""),
+                "window.yunData" in (html or ""),
+                '"shareid"' in (html or ""),
+                '"file_list"' in (html or ""),
+                BaiduCurlPlugin._looks_like_login_page(html or ""),
+            )
+        except Exception:
+            logger.warning("[builtin] 无法从分享页提取数据（诊断日志生成失败）")
+
     def _list_share_files_sync(self, surl: str, pwd: str) -> dict:
         """列出分享中的所有文件（不转存）
 
@@ -1415,7 +1757,7 @@ class BaiduCurlPlugin(Star):
             with cffi_requests.Session(impersonate="chrome120") as s:
 
                 # 解析 Cookie
-                cookies = self._parse_cookie_string(self.baidu_cookies)
+                cookies = self._parse_cookie_string(self._get_baidu_cookies())
                 if not cookies.get("BDUSS"):
                     return {"success": False, "error": "Cookie 中缺少 BDUSS，请检查 Cookie 是否正确"}
                 if not cookies.get("STOKEN"):
@@ -1461,38 +1803,12 @@ class BaiduCurlPlugin(Star):
                 resp = s.get(share_url, timeout=15)
                 html = resp.text
 
-                match = re.search(r"(?:yunData\.setData|locals\.mset)\(", html)
-                if not match:
+                shared_data, parse_err = self._extract_share_data(html)
+                if shared_data is None:
+                    if parse_err == "bad_json":
+                        return {"success": False, "error": "解析分享数据失败"}
+                    self._log_share_page_diagnosis(resp, html)
                     return {"success": False, "error": "无法解析分享页面，可能 Cookie 已过期或分享已失效"}
-
-                start = match.end()
-                # 健壮的 JSON 提取：记录字符串状态，避免字符串中的花括号干扰
-                brace_count = 0
-                in_string = False
-                escaped = False
-                end = start
-                for i, c in enumerate(html[start:], start):
-                    if in_string:
-                        if escaped:
-                            escaped = False
-                        elif c == '\\':
-                            escaped = True
-                        elif c == '"':
-                            in_string = False
-                    elif c == '"':
-                        in_string = True
-                    elif c == '{':
-                        brace_count += 1
-                    elif c == '}':
-                        brace_count -= 1
-                        if brace_count == 0:
-                            end = i + 1
-                            break
-
-                try:
-                    shared_data = json.loads(html[start:end])
-                except json.JSONDecodeError:
-                    return {"success": False, "error": "解析分享数据失败"}
 
                 uk = int(shared_data.get("share_uk") or shared_data.get("uk", 0))
                 share_id = shared_data.get("shareid")
@@ -1659,7 +1975,7 @@ class BaiduCurlPlugin(Star):
 
             # 创建 session 并设置 cookie
             with cffi_requests.Session(impersonate="chrome120") as s:
-                cookies = self._parse_cookie_string(self.baidu_cookies)
+                cookies = self._parse_cookie_string(self._get_baidu_cookies())
                 for k, v in cookies.items():
                     if v:
                         s.cookies.set(k, v)
@@ -1685,7 +2001,7 @@ class BaiduCurlPlugin(Star):
                     )
 
                 # 确保目标目录存在
-                save_dir = self.save_dir
+                save_dir = self._get_save_dir()
                 self._ensure_dir_exists(s, save_dir)
 
                 # 调用 transfer API
@@ -1880,7 +2196,7 @@ class BaiduCurlPlugin(Star):
 
     async def _move_single_dir(self, from_dir: str, to_dir: str) -> bool:
         """移动单个目录到目标目录"""
-        if not self.openlist_url or not self.openlist_user:
+        if not self._get_openlist_url() or not self._get_openlist_user():
             logger.warning("[move] 未配置 OpenList，跳过移动")
             return False
 
@@ -1897,8 +2213,8 @@ class BaiduCurlPlugin(Star):
         """用已有 session 登录 OpenList，返回 (headers, pan_prefix) 或 (None, None)"""
         try:
             login_resp = session.post(
-                f"{self.openlist_url}/api/auth/login",
-                json={"username": self.openlist_user, "password": self.openlist_pass},
+                f"{self._get_openlist_url()}/api/auth/login",
+                json={"username": self._get_openlist_user(), "password": self._get_openlist_pass()},
                 allow_redirects=False,
                 timeout=15,
             )
@@ -1906,7 +2222,7 @@ class BaiduCurlPlugin(Star):
             if not admin_token:
                 logger.error("[move] OpenList 登录失败")
                 return None, None
-            return {"Authorization": admin_token}, self.openlist_pan_path
+            return {"Authorization": admin_token}, self._get_openlist_pan_path()
         except Exception as e:
             logger.exception(f"[move] OpenList 登录异常: {e}")
             return None, None
@@ -1922,7 +2238,7 @@ class BaiduCurlPlugin(Star):
                 # 获取源目录里的文件
                 src_path = f"{pan_prefix}{from_dir}"
                 resp = s.post(
-                    f"{self.openlist_url}/api/fs/list",
+                    f"{self._get_openlist_url()}/api/fs/list",
                     headers=headers,
                     json={
                         "path": src_path,
@@ -1952,7 +2268,7 @@ class BaiduCurlPlugin(Star):
                 folder_name = from_dir.rstrip("/").split("/")[-1]
                 dst_path = f"{pan_prefix}{to_dir}/{folder_name}"
                 s.post(
-                    f"{self.openlist_url}/api/fs/mkdir",
+                    f"{self._get_openlist_url()}/api/fs/mkdir",
                     headers=headers,
                     json={"path": dst_path},
                     timeout=10,
@@ -1960,7 +2276,7 @@ class BaiduCurlPlugin(Star):
 
                 # 移动文件
                 move_resp = s.post(
-                    f"{self.openlist_url}/api/fs/move",
+                    f"{self._get_openlist_url()}/api/fs/move",
                     headers=headers,
                     json={"src_dir": src_path, "dst_dir": dst_path, "names": files},
                     timeout=30,
@@ -1977,7 +2293,7 @@ class BaiduCurlPlugin(Star):
                         name = parts[i - 1]
                         parent_path = pan_prefix + parent
                         s.post(
-                            f"{self.openlist_url}/api/fs/remove",
+                            f"{self._get_openlist_url()}/api/fs/remove",
                             headers=headers,
                             json={"dir": parent_path, "names": [name]},
                             timeout=10,
@@ -1993,7 +2309,7 @@ class BaiduCurlPlugin(Star):
 
     async def _move_folder(self, from_dir: str, to_dir: str) -> bool:
         """用 OpenList API 移动整个文件夹"""
-        if not self.openlist_url or not self.openlist_user:
+        if not self._get_openlist_url() or not self._get_openlist_user():
             logger.warning("[move] 未配置 OpenList，跳过移动")
             return False
 
@@ -2017,7 +2333,7 @@ class BaiduCurlPlugin(Star):
 
                 # 扫描百度网盘根目录，找最近的 sharelink 文件夹
                 resp = s.post(
-                    f"{self.openlist_url}/api/fs/list",
+                    f"{self._get_openlist_url()}/api/fs/list",
                     headers=headers,
                     json={
                         "path": f"{pan_prefix}/",
@@ -2064,7 +2380,7 @@ class BaiduCurlPlugin(Star):
 
                 # 获取源目录里的所有文件
                 resp2 = s.post(
-                    f"{self.openlist_url}/api/fs/list",
+                    f"{self._get_openlist_url()}/api/fs/list",
                     headers=headers,
                     json={"path": src_path, "page": 1, "per_page": 100, "refresh": True},
                     timeout=10,
@@ -2083,7 +2399,7 @@ class BaiduCurlPlugin(Star):
 
                 # 创建目标子目录
                 s.post(
-                    f"{self.openlist_url}/api/fs/mkdir",
+                    f"{self._get_openlist_url()}/api/fs/mkdir",
                     headers=headers,
                     json={"path": dst_path},
                     timeout=10,
@@ -2091,7 +2407,7 @@ class BaiduCurlPlugin(Star):
 
                 # 移动所有文件
                 move_resp = s.post(
-                    f"{self.openlist_url}/api/fs/move",
+                    f"{self._get_openlist_url()}/api/fs/move",
                     headers=headers,
                     json={"src_dir": src_path, "dst_dir": dst_path, "names": files},
                     timeout=30,
@@ -2104,7 +2420,7 @@ class BaiduCurlPlugin(Star):
                 if code == 200:
                     # 删除空的源目录
                     s.post(
-                        f"{self.openlist_url}/api/fs/remove",
+                        f"{self._get_openlist_url()}/api/fs/remove",
                         headers=headers,
                         json={"dir": f"{pan_prefix}", "names": [newest_dir["name"]]},
                         timeout=10,
@@ -2115,7 +2431,7 @@ class BaiduCurlPlugin(Star):
                     logger.info(f"[move] 文件已存在，跳过移动")
                     # 文件已存在说明之前移过了，也删除源目录
                     s.post(
-                        f"{self.openlist_url}/api/fs/remove",
+                        f"{self._get_openlist_url()}/api/fs/remove",
                         headers=headers,
                         json={"dir": f"{pan_prefix}", "names": [newest_dir["name"]]},
                         timeout=10,
@@ -2131,13 +2447,14 @@ class BaiduCurlPlugin(Star):
 
     def _can_push(self, ev: AstrMessageEvent) -> bool:
         """推送白名单检查：仅 push_whitelist 中的会话可触发推送"""
-        if not self.push_whitelist:
+        push_whitelist = self._get_push_whitelist()
+        if not push_whitelist:
             return False
-        return ev.session_id in self.push_whitelist
+        return ev.session_id in push_whitelist
 
     def _get_bduss(self) -> str:
         """从 baidu_cookies 提取 BDUSS（推送下载器时需要，配合 UA 实现会员满速）"""
-        cookies = self._parse_cookie_string(self.baidu_cookies)
+        cookies = self._parse_cookie_string(self._get_baidu_cookies())
         return cookies.get("BDUSS", "")
 
     async def _do_push(self, ev: AstrMessageEvent, dlinks: list):
@@ -2157,7 +2474,7 @@ class BaiduCurlPlugin(Star):
                 "⚠️ 未找到 BDUSS Cookie，无法推送\n"
                 "（会员满速下载需要携带 UA + BDUSS Cookie，请检查 baidu_cookies 配置）"
             )
-        if not self.motrix_rpc_url:
+        if not self._get_motrix_rpc_url():
             return (
                 "⚠️ 未配置 Motrix\n"
                 "请在设置中配置 motrix_rpc_url（如 http://127.0.0.1:16800/jsonrpc）"
@@ -2165,11 +2482,11 @@ class BaiduCurlPlugin(Star):
 
         results = []
         # 非本机 RPC 且未设置密钥时，BDUSS 将明文经过网络传输，给出警告
-        rpc_url = self.motrix_rpc_url.lower()
+        rpc_url = self._get_motrix_rpc_url().lower()
         is_local = any(
             h in rpc_url for h in ("//127.0.0.1", "//localhost", "//[::1]")
         )
-        if not is_local and not self.motrix_rpc_token:
+        if not is_local and not self._get_motrix_rpc_token():
             logger.warning(
                 "[push] Motrix RPC 地址非本机且未设置密钥，BDUSS 将明文过网，"
                 "建议配置 motrix_rpc_token 或改用 127.0.0.1"
@@ -2202,11 +2519,11 @@ class BaiduCurlPlugin(Star):
             f"Cookie: BDUSS={bduss}",
         ]
         options = {"out": self._sanitize_filename(filename), "header": headers}
-        if self.motrix_download_dir:
-            options["dir"] = self.motrix_download_dir
+        if self._get_motrix_download_dir():
+            options["dir"] = self._get_motrix_download_dir()
         params = [[url], options]
-        if self.motrix_rpc_token:
-            params.insert(0, f"token:{self.motrix_rpc_token}")
+        if self._get_motrix_rpc_token():
+            params.insert(0, f"token:{self._get_motrix_rpc_token()}")
         payload = {
             "id": str(int(time.time() * 1000)),
             "jsonrpc": "2.0",
@@ -2216,7 +2533,7 @@ class BaiduCurlPlugin(Star):
         try:
             async with aiohttp.ClientSession() as sess:
                 async with sess.post(
-                    self.motrix_rpc_url,
+                    self._get_motrix_rpc_url(),
                     json=payload,
                     timeout=15,
                 ) as resp:
